@@ -5,34 +5,25 @@ set -euo pipefail
 # No Black Boxes installation.
 #
 # Usage:
-#   ./install_orchestra_code.sh <raw-github-base-url>
+#   ./install_orchestra_code.sh
 #
-# Example:
-#   ./install_orchestra_code.sh \
-#     https://raw.githubusercontent.com/USERNAME/REPO/main
+# Code is downloaded from:
+#   https://github.com/lumar1729/nbb-orchestra
 #
-# The base URL should contain the directory in which these files live:
-#   pi_message_client.py
-#   play_wav.py
-#
-# The script deliberately uses $HOME rather than /home/lucarakowski.
+# The script deliberately uses $HOME rather than a hard-coded username.
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <raw-github-base-url>"
-    echo
-    echo "Example:"
-    echo "  $0 https://raw.githubusercontent.com/USERNAME/REPO/main"
+if [[ $# -ne 0 ]]; then
+    echo "Usage: $0"
     exit 1
 fi
 
-RAW_BASE_URL="${1%/}"
+RAW_BASE_URL="https://raw.githubusercontent.com/lumar1729/nbb-orchestra/main"
 
 PI_CLIENT_DEST="$HOME/pi_message_client.py"
 LBB_ROOT="$HOME/NoBlackBoxes/LastBlackBox"
 GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/generation"
 PLAY_WAV_DEST="$GENERATION_DIR/play_wav.py"
 
-# Source paths inside the deployment repository.
 PI_CLIENT_SOURCE="$RAW_BASE_URL/pi_message_client.py"
 PLAY_WAV_SOURCE="$RAW_BASE_URL/play_wav.py"
 
@@ -41,7 +32,6 @@ echo " No Black Boxes Orchestra Code Setup"
 echo "========================================"
 echo
 
-# Check that the existing No Black Boxes installation is present.
 if [[ ! -d "$LBB_ROOT" ]]; then
     echo "ERROR: No Black Boxes installation not found:"
     echo "  $LBB_ROOT"
@@ -51,7 +41,6 @@ if [[ ! -d "$LBB_ROOT" ]]; then
     exit 1
 fi
 
-# Check for curl.
 if ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: curl is not installed."
     echo "Install it with:"
@@ -85,19 +74,9 @@ download_file() {
     fi
 }
 
-# Download to temporary files first. This means a failed download cannot
-# destroy the currently installed working version.
-download_file \
-    "$PI_CLIENT_SOURCE" \
-    "$TMP_DIR/pi_message_client.py" \
-    "pi_message_client.py"
+download_file "$PI_CLIENT_SOURCE" "$TMP_DIR/pi_message_client.py" "pi_message_client.py"
+download_file "$PLAY_WAV_SOURCE" "$TMP_DIR/play_wav.py" "play_wav.py"
 
-download_file \
-    "$PLAY_WAV_SOURCE" \
-    "$TMP_DIR/play_wav.py" \
-    "play_wav.py"
-
-# Basic sanity checks before installing.
 if ! grep -qE '^#!|import |from ' "$TMP_DIR/pi_message_client.py"; then
     echo "WARNING: pi_message_client.py does not look like a Python source file."
 fi
@@ -106,10 +85,8 @@ if ! grep -qE '^#!|import |from ' "$TMP_DIR/play_wav.py"; then
     echo "WARNING: play_wav.py does not look like a Python source file."
 fi
 
-# Preserve previous versions if they exist.
 backup_file() {
     local file="$1"
-
     if [[ -f "$file" ]]; then
         cp "$file" "$file.backup"
         echo "Backed up:"
