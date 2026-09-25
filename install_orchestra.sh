@@ -100,6 +100,12 @@ echo "Downloading deployment scripts..."
 download_script "install_orchestra_code.sh"
 download_script "setup_chrony.sh"
 download_script "update_wavs.sh"
+
+# The installer itself is running as root, so mktemp creates a private
+# root-owned directory. Steps 1 and 3 run as the normal Pi user, so give
+# that user access to the downloaded deployment scripts.
+chown -R "$ORCHESTRA_USER:$ORCHESTRA_USER" "$TMP_DIR"
+
 echo
 
 echo "========================================"
