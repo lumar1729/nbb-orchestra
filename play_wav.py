@@ -19,7 +19,7 @@ import NB3.Sound.utilities as Utilities
 # Change this to the WAV file you want to play.
 WAV_FILE = (
     f"{Config.repo_path}/boxes/audio/signal-processing/"
-    f"python/generation/Choir.wav"
+    f"python/generation/wav/Choir.wav"
 )
 
 # Speaker settings
