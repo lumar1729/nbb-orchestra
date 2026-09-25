@@ -205,13 +205,13 @@ chronyc sources -v
 After installation:
 
 ```bash
-~/NoBlackBoxes/LastBlackBox/_tmp/LBB/bin/python ~/pi_message_client.py SERVER_IP
+/home/yourname/NoBlackBoxes/LastBlackBox/_tmp/LBB/bin/python /home/yourname/pi_message_client.py SERVER_IP
 ```
 
 For example:
 
 ```bash
-~/NoBlackBoxes/LastBlackBox/_tmp/LBB/bin/python ~/pi_message_client.py 192.168.1.115
+/home/yourname/NoBlackBoxes/LastBlackBox/_tmp/LBB/bin/python /home/yourname/pi_message_client.py 192.168.1.115
 ```
 
 ## Repository files
