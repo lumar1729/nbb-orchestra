@@ -10,6 +10,22 @@ import soundfile as sf
 import LBB.config as Config
 import NB3.Sound.speaker as Speaker
 import NB3.Sound.utilities as Utilities
+import contextlib
+
+
+@contextlib.contextmanager
+def suppress_stderr():
+    """Temporarily suppress native-library messages written to stderr."""
+    stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(stderr_fd)
+
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            yield
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
 
 
 # ============================================================
@@ -165,23 +181,24 @@ audio = np.clip(audio, -1.0, 1.0)
 
 #Utilities.list_devices()
 
-output_device = Utilities.get_output_device_by_name(
-    OUTPUT_DEVICE_NAME
-)
+with suppress_stderr():
 
-if output_device == -1:
-    raise RuntimeError(
-        f"Output device '{OUTPUT_DEVICE_NAME}' not found."
+    output_device = Utilities.get_output_device_by_name(
+        OUTPUT_DEVICE_NAME
     )
 
+    if output_device == -1:
+        raise RuntimeError(
+            f"Output device '{OUTPUT_DEVICE_NAME}' not found."
+        )
 
-speaker = Speaker.Speaker(
-    output_device,
-    NUM_CHANNELS,
-    "int32",
-    SAMPLE_RATE,
-    BUFFER_SIZE
-)
+    speaker = Speaker.Speaker(
+        output_device,
+        NUM_CHANNELS,
+        "int32",
+        SAMPLE_RATE,
+        BUFFER_SIZE
+    )
 
 
 # ============================================================
