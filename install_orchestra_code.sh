@@ -21,7 +21,7 @@ RAW_BASE_URL="https://raw.githubusercontent.com/lumar1729/nbb-orchestra/main"
 
 PI_CLIENT_DEST="$HOME/pi_message_client.py"
 LBB_ROOT="$HOME/NoBlackBoxes/LastBlackBox"
-GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/generation"
+GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/python/generation"
 PLAY_WAV_DEST="$GENERATION_DIR/play_wav.py"
 
 PI_CLIENT_SOURCE="$RAW_BASE_URL/pi_message_client.py"
