@@ -28,7 +28,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 SERVER_HOST="$1"
-SERVER_PORT="${ORCHESTRA_WAV_PORT:-8000}"
+SERVER_PORT="${ORCHESTRA_WAV_PORT:-8001}"
 SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
 
 LBB_ROOT="$HOME/NoBlackBoxes/LastBlackBox"
