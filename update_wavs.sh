@@ -32,7 +32,7 @@ SERVER_PORT="${ORCHESTRA_WAV_PORT:-8001}"
 SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
 
 LBB_ROOT="$HOME/NoBlackBoxes/LastBlackBox"
-GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/generation"
+GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/python/generation"
 WAV_DIR="$GENERATION_DIR/wav"
 
 echo "========================================"
