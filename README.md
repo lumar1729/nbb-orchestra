@@ -130,13 +130,13 @@ The installer detects the invoking user's home directory, so it does not depend 
 `play_wav.py`:
 
 ```text
-~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/generation/play_wav.py
+~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/python/generation/play_wav.py
 ```
 
 WAV library:
 
 ```text
-~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/generation/wav/
+~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/python/generation/wav/
 ```
 
 ## Updating orchestra code
