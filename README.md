@@ -145,10 +145,18 @@ curl -fsSL https://raw.githubusercontent.com/lumar1729/nbb-orchestra/main/update
 
 The new library is downloaded to a temporary directory first and replaces the existing library only after all files download successfully.
 
+To update the library and set a new default WAV at the same time:
+
+```bash
+/tmp/update_wavs.sh SERVER_IP -d Strings.wav
+```
+
+`--default Strings` is equivalent; the `.wav` extension is optional. The requested file is checked against the newly downloaded library before anything is replaced. If it is not found, the existing WAV library and default are left unchanged. If `-d`/`--default` is omitted, the existing `default_wav.txt` is left unchanged.
+
 The default WAV-server port is 8001. To override it:
 
 ```bash
-ORCHESTRA_WAV_PORT=9000 /tmp/update_wavs.sh SERVER_IP
+ORCHESTRA_WAV_PORT=9000 /tmp/update_wavs.sh SERVER_IP -d Strings
 ```
 
 ## Changing the default WAV manually

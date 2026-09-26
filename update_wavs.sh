@@ -4,10 +4,12 @@ set -euo pipefail
 # Update the No Black Boxes orchestra WAV library from a server on the LAN.
 #
 # Usage:
-#   ./update_wavs.sh <server-ip-or-hostname>
+#   ./update_wavs.sh <server-ip-or-hostname> [-d|--default <wav-file>]
 #
-# Example:
+# Examples:
 #   ./update_wavs.sh 192.168.1.115
+#   ./update_wavs.sh 192.168.1.115 -d Strings
+#   ./update_wavs.sh 192.168.1.115 --default Strings.wav
 #
 # The server is expected to expose the WAV directory over HTTP on port 8000.
 # Example server command:
@@ -19,21 +21,54 @@ set -euo pipefail
 # The existing WAV directory is replaced only after the new library has
 # downloaded successfully.
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <server-ip-or-hostname>"
+usage() {
+    echo "Usage: $0 <server-ip-or-hostname> [-d|--default <wav-file>]"
     echo
-    echo "Example:"
+    echo "Examples:"
     echo "  $0 192.168.1.115"
+    echo "  $0 192.168.1.115 -d Strings"
+    echo "  $0 192.168.1.115 --default Strings.wav"
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
     exit 1
 fi
 
 SERVER_HOST="$1"
+shift
+
+DEFAULT_WAV=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--default)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "ERROR: $1 requires a WAV filename."
+                usage
+                exit 1
+            fi
+            DEFAULT_WAV="$2"
+            shift 2
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -n "$DEFAULT_WAV" && "${DEFAULT_WAV,,}" != *.wav ]]; then
+    DEFAULT_WAV="${DEFAULT_WAV}.wav"
+fi
 SERVER_PORT="${ORCHESTRA_WAV_PORT:-8001}"
 SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
 
 LBB_ROOT="$HOME/NoBlackBoxes/LastBlackBox"
 GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/python/generation"
 WAV_DIR="$GENERATION_DIR/wav"
+DEFAULT_WAV_FILE="$GENERATION_DIR/default_wav.txt"
 
 echo "========================================"
 echo " No Black Boxes WAV Library Update"
@@ -41,6 +76,9 @@ echo "========================================"
 echo
 echo "WAV server: $SERVER_URL"
 echo "Destination: $WAV_DIR"
+if [[ -n "$DEFAULT_WAV" ]]; then
+    echo "New default: $DEFAULT_WAV"
+fi
 echo
 
 if [[ ! -d "$LBB_ROOT" ]]; then
@@ -180,6 +218,28 @@ if [[ "$DOWNLOADED_COUNT" -eq 0 ]]; then
 fi
 
 echo "Downloaded $DOWNLOADED_COUNT WAV file(s)."
+
+RESOLVED_DEFAULT=""
+if [[ -n "$DEFAULT_WAV" ]]; then
+    # Match case-insensitively but preserve the exact downloaded filename.
+    while IFS= read -r -d '' candidate; do
+        candidate_name="$(basename "$candidate")"
+        if [[ "${candidate_name,,}" == "${DEFAULT_WAV,,}" ]]; then
+            RESOLVED_DEFAULT="$candidate_name"
+            break
+        fi
+    done < <(find "$TMP_WAV_DIR" -maxdepth 1 -type f -iname '*.wav' -print0)
+
+    if [[ -z "$RESOLVED_DEFAULT" ]]; then
+        echo
+        echo "ERROR: Requested default WAV was not found in the downloaded library:"
+        echo "  $DEFAULT_WAV"
+        echo
+        echo "The existing WAV library and default have NOT been changed."
+        exit 1
+    fi
+fi
+
 echo
 echo "Replacing existing WAV library..."
 
@@ -209,6 +269,10 @@ fi
 
 rm -rf "$BACKUP_WAV_DIR"
 
+if [[ -n "$RESOLVED_DEFAULT" ]]; then
+    printf '%s\n' "$RESOLVED_DEFAULT" > "$DEFAULT_WAV_FILE"
+fi
+
 echo
 echo "========================================"
 echo " WAV update complete"
@@ -216,4 +280,9 @@ echo "========================================"
 echo
 echo "Installed $DOWNLOADED_COUNT WAV file(s) to:"
 echo "  $WAV_DIR"
+if [[ -n "$RESOLVED_DEFAULT" ]]; then
+    echo
+    echo "Default WAV: $RESOLVED_DEFAULT"
+    echo "Saved to: $DEFAULT_WAV_FILE"
+fi
 echo
