@@ -24,10 +24,16 @@ LBB_ROOT="$HOME/NoBlackBoxes/LastBlackBox"
 GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/python/generation"
 PLAY_WAV_DEST="$GENERATION_DIR/play_wav.py"
 ASSIGN_WAVS_DEST="$GENERATION_DIR/assign_wavs.py"
+BINAURAL_CHIRP_TEST_DEST="$GENERATION_DIR/binaural_chirp_test.py"
+GENERATE_LOCALISATION_CHIRP_DEST="$GENERATION_DIR/generate_localisation_chirp.py"
+LOCALISATION_CHIRP_DEST="$GENERATION_DIR/localisation_chirp.wav"
 
 PI_CLIENT_SOURCE="$RAW_BASE_URL/pi_message_client.py"
 PLAY_WAV_SOURCE="$RAW_BASE_URL/play_wav.py"
 ASSIGN_WAVS_SOURCE="$RAW_BASE_URL/assign_wavs.py"
+BINAURAL_CHIRP_TEST_SOURCE="$RAW_BASE_URL/binaural_chirp_test.py"
+GENERATE_LOCALISATION_CHIRP_SOURCE="$RAW_BASE_URL/generate_localisation_chirp.py"
+LOCALISATION_CHIRP_SOURCE="$RAW_BASE_URL/localisation_chirp.wav"
 
 echo "========================================"
 echo " No Black Boxes Orchestra Code Setup"
@@ -79,6 +85,9 @@ download_file() {
 download_file "$PI_CLIENT_SOURCE" "$TMP_DIR/pi_message_client.py" "pi_message_client.py"
 download_file "$PLAY_WAV_SOURCE" "$TMP_DIR/play_wav.py" "play_wav.py"
 download_file "$ASSIGN_WAVS_SOURCE" "$TMP_DIR/assign_wavs.py" "assign_wavs.py"
+download_file "$BINAURAL_CHIRP_TEST_SOURCE" "$TMP_DIR/binaural_chirp_test.py" "binaural_chirp_test.py"
+download_file "$GENERATE_LOCALISATION_CHIRP_SOURCE" "$TMP_DIR/generate_localisation_chirp.py" "generate_localisation_chirp.py"
+download_file "$LOCALISATION_CHIRP_SOURCE" "$TMP_DIR/localisation_chirp.wav" "localisation_chirp.wav"
 
 if ! grep -qE '^#!|import |from ' "$TMP_DIR/pi_message_client.py"; then
     echo "WARNING: pi_message_client.py does not look like a Python source file."
@@ -104,15 +113,24 @@ backup_file() {
 backup_file "$PI_CLIENT_DEST"
 backup_file "$PLAY_WAV_DEST"
 backup_file "$ASSIGN_WAVS_DEST"
+backup_file "$BINAURAL_CHIRP_TEST_DEST"
+backup_file "$GENERATE_LOCALISATION_CHIRP_DEST"
+backup_file "$LOCALISATION_CHIRP_DEST"
 
 install -m 755 "$TMP_DIR/pi_message_client.py" "$PI_CLIENT_DEST"
 install -m 755 "$TMP_DIR/play_wav.py" "$PLAY_WAV_DEST"
 install -m 755 "$TMP_DIR/assign_wavs.py" "$ASSIGN_WAVS_DEST"
+install -m 755 "$TMP_DIR/binaural_chirp_test.py" "$BINAURAL_CHIRP_TEST_DEST"
+install -m 755 "$TMP_DIR/generate_localisation_chirp.py" "$GENERATE_LOCALISATION_CHIRP_DEST"
+install -m 644 "$TMP_DIR/localisation_chirp.wav" "$LOCALISATION_CHIRP_DEST"
 
 echo
 echo "Installed:"
 echo "  $PI_CLIENT_DEST"
 echo "  $PLAY_WAV_DEST"
 echo "  $ASSIGN_WAVS_DEST"
+echo "  $BINAURAL_CHIRP_TEST_DEST"
+echo "  $GENERATE_LOCALISATION_CHIRP_DEST"
+echo "  $LOCALISATION_CHIRP_DEST"
 echo
 echo "Orchestra code setup complete."

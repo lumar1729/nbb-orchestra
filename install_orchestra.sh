@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Initial installer for the No Black Boxes orchestra.
+# Installs orchestra playback/assignment/localisation code and assets.
 #
 # Assumes the main LastBlackBox repository is already installed at:
 #   ~/NoBlackBoxes/LastBlackBox
@@ -131,7 +132,7 @@ chown -R "$ORCHESTRA_USER:$ORCHESTRA_USER" "$TMP_DIR"
 echo
 
 echo "========================================"
-echo " Step 1/3 - Install orchestra code"
+echo " Step 1/3 - Install orchestra code + localisation assets"
 echo "========================================"
 sudo -u "$ORCHESTRA_USER" \
     env HOME="$ORCHESTRA_HOME" \
