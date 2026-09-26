@@ -108,6 +108,36 @@ curl -fsSL https://raw.githubusercontent.com/lumar1729/nbb-orchestra/main/instal
 && sudo /tmp/install_orchestra.sh 192.168.1.115
 ```
 
+### Choosing the default WAV
+
+The installer can optionally assign a default WAV file to the Pi with `-d` or `--default`.
+
+For example:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lumar1729/nbb-orchestra/main/install_orchestra.sh -o /tmp/install_orchestra.sh \
+&& chmod +x /tmp/install_orchestra.sh \
+&& sudo /tmp/install_orchestra.sh 192.168.1.115 -d Choir.wav
+```
+
+The `.wav` extension is optional, so this is equivalent:
+
+```bash
+sudo /tmp/install_orchestra.sh 192.168.1.115 --default Choir
+```
+
+The requested filename is matched case-insensitively against the WAV files downloaded from the server. If the requested WAV does not exist, installation stops and prints the available WAV filenames.
+
+If `-d` / `--default` is not provided, the installer selects the first `.wav` file alphabetically.
+
+The selected filename is stored on the Pi in:
+
+```text
+~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/python/generation/default_wav.txt
+```
+
+`play_wav.py` reads this file when it starts. If `default_wav.txt` is absent or empty, `play_wav.py` also falls back to the first WAV alphabetically. This keeps the playback code identical across Pis while allowing each Pi to have its own assigned default instrument or role.
+
 The installer:
 
 1. Checks that `LastBlackBox` already exists.
@@ -116,6 +146,7 @@ The installer:
 4. Installs `pi_message_client.py` and `play_wav.py`.
 5. Configures Chrony to synchronise with the specified server.
 6. Downloads the current WAV library from `SERVER_IP:8001`.
+7. Selects the requested default WAV, or the first WAV alphabetically if no default was specified, and writes it to `default_wav.txt`.
 
 The installer detects the invoking user's home directory, so it does not depend on the username being `lucarakowski`.
 
@@ -137,6 +168,18 @@ WAV library:
 
 ```text
 ~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/python/generation/wav/
+```
+
+Default WAV configuration:
+
+```text
+~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/python/generation/default_wav.txt
+```
+
+For example, a Pi assigned to the choir part might contain:
+
+```text
+Choir.wav
 ```
 
 ## Updating orchestra code
@@ -182,6 +225,22 @@ The default WAV port is 8001. It can be overridden if necessary:
 ```bash
 ORCHESTRA_WAV_PORT=9000 /tmp/update_wavs.sh SERVER_IP
 ```
+
+## Changing a Pi's default WAV
+
+The default can be changed without reinstalling the orchestra software. Edit:
+
+```text
+~/NoBlackBoxes/LastBlackBox/boxes/audio/signal-processing/python/generation/default_wav.txt
+```
+
+and set it to the filename of one of the WAV files in the `wav/` directory, for example:
+
+```text
+Piano.wav
+```
+
+This per-Pi configuration is intended to make it straightforward to add server-assigned roles later without changing `play_wav.py` on each Pi.
 
 ## Reconfiguring Chrony
 
