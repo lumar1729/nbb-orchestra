@@ -36,6 +36,8 @@ import socket
 import sys
 import time       # perf_counter times each poll for the Pi->server lag
 import base64
+import http.server
+import socketserver
 
 import os
 import shutil
@@ -58,6 +60,79 @@ SYNC_SPIN_MARGIN = 0.05  # Last 50ms before a scheduled run are a BUSY-SPIN:
 # Working directory used for commands sent from the server. It is persistent
 # for the lifetime of the client process; `cd` updates it.
 COMMAND_CWD = None
+
+# Kill-all control channel. The laptop POSTs to message-board port + 1 so a
+# running command can be terminated even while the normal command poller is
+# blocked waiting for that process to finish.
+command_processes = set()
+command_process_lock = threading.Lock()
+
+
+def register_process(process):
+    """Register a child process so the independent kill listener can stop it."""
+    with command_process_lock:
+        command_processes.add(process)
+
+
+def unregister_process(process):
+    with command_process_lock:
+        command_processes.discard(process)
+
+
+def terminate_command_process(process):
+    """Terminate one child and, on Linux, its complete process group."""
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(process.pid), 15)
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+
+def kill_command_processes():
+    with command_process_lock:
+        processes = list(command_processes)
+    for process in processes:
+        terminate_command_process(process)
+    return len(processes)
+
+
+class ControlHandler(http.server.BaseHTTPRequestHandler):
+    """Small independent HTTP endpoint used only for the server's Kill All."""
+
+    def do_POST(self):
+        if self.path == "/kill_all":
+            count = kill_command_processes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"ok": True, "killed": count}).encode("utf-8")
+            )
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *_args):
+        pass
+
+
+def serve_control_port(base_port):
+    """Listen on base_port + 1 without blocking the normal message client."""
+    try:
+        socketserver.ThreadingTCPServer.allow_reuse_address = True
+        with socketserver.ThreadingTCPServer(("", base_port + 1), ControlHandler) as server:
+            server.serve_forever()
+    except OSError as error:
+        print(
+            f"WARNING: Kill-all control listener could not bind to "
+            f"port {base_port + 1}: {error}",
+            flush=True,
+        )
 # a remote shell for strangers on the network. Add more if you need them!
 ALLOWED_COMMANDS = [
     "uptime", "hostname", "whoami", "date", "ls", "pwd",
@@ -276,7 +351,9 @@ def run_audio_checkpoint(command, target, stop_event):
     try:
         proc = subprocess.Popen(words, cwd=COMMAND_CWD, env=env,
                                 pass_fds=(ready_w, go_r), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
+                                stderr=subprocess.PIPE, text=True,
+                                start_new_session=(os.name == "posix"))
+        register_process(proc)
         os.close(ready_w)
         os.close(go_r)
         os.read(ready_r, 6)
@@ -288,7 +365,10 @@ def run_audio_checkpoint(command, target, stop_event):
         trigger_at = time.time()
         os.write(go_w, b"G")
         os.close(go_w)
-        stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        try:
+            stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        finally:
+            unregister_process(proc)
         text = (stdout or "") + (stderr or "")
         checkpoint = next((float(line.split(":", 1)[1]) for line in text.splitlines()
                            if line.startswith("AUDIO_CHECKPOINT:")), None)
@@ -348,9 +428,14 @@ def handle_binaural_command(server_ip, port, pi_name, command, stop_event):
     try:
         proc = subprocess.Popen(
             words, cwd=COMMAND_CWD, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=(os.name == "posix")
         )
-        stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        register_process(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        finally:
+            unregister_process(proc)
         output = ((stdout or "") + (stderr or "")).strip()
         if output:
             http_post(server_ip, port, "/post_result", {
@@ -560,13 +645,19 @@ def run_command(command):
                 ]
         else:
             invocation = ["bash", "-ic", "Activate"] if words[0] == "Activate" else words
-        output = subprocess.run(
-            invocation, capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
-            cwd=COMMAND_CWD
+        process = subprocess.Popen(
+            invocation, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=COMMAND_CWD,
+            start_new_session=(os.name == "posix")
         )
-        text = output.stdout + output.stderr
-        if output.returncode != 0:
-            text = (f"(exit status {output.returncode})\n" + text).strip()
+        register_process(process)
+        try:
+            stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT)
+        finally:
+            unregister_process(process)
+        text = (stdout or "") + (stderr or "")
+        if process.returncode != 0:
+            text = (f"(exit status {process.returncode})\n" + text).strip()
         return text.strip() or "(command produced no output)"
     except subprocess.TimeoutExpired as error:
         stdout = error.stdout or ""
@@ -603,12 +694,17 @@ def run_benchmark_once(command, intended_at, executed_at, stop_event):
         proc = subprocess.Popen([words[0], "-c", wrapper] + words[1:],
                                 cwd=COMMAND_CWD, pass_fds=(write_fd,),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True)
+                                text=True,
+                                start_new_session=(os.name == "posix"))
+        register_process(proc)
         os.close(write_fd)
         os.read(read_fd, 5)
         ready = time.time()
         os.close(read_fd)
-        stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        try:
+            stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        finally:
+            unregister_process(proc)
         finished = time.time()
         output = (stdout or "") + (stderr or "")
         return {"status": "ok" if proc.returncode == 0 else "error",
@@ -924,6 +1020,14 @@ if __name__ == "__main__":
         print("   - Are both devices on the same network?", flush=True)
         print(f"   - Is {server_ip} the laptop's correct IP address?", flush=True)
         sys.exit(1)
+
+    # Kill All uses an independent Pi-side listener on port+1. Keep this
+    # separate from the command poller so it remains responsive while a child
+    # command is running.
+    control_listener = threading.Thread(
+        target=serve_control_port, args=(port,), daemon=True
+    )
+    control_listener.start()
 
     # A flag the main thread flips when it wants the poller to stop
     stop_event = threading.Event()
