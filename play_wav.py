@@ -63,6 +63,13 @@ parser.add_argument(
     help="Volume from 0-100. 100 = maximum, 0 = silent."
 )
 
+parser.add_argument(
+    "--file",
+    default=None,
+    help=("Optional WAV filename or absolute path. When omitted, the existing "
+          "default_wav.txt selection is used exactly as before."),
+)
+
 args = parser.parse_args()
 
 
@@ -88,24 +95,45 @@ wav_files = sorted(
 if not wav_files:
     raise FileNotFoundError(f"No WAV files found in:\n{WAV_DIR}")
 
-configured_default = ""
-if os.path.isfile(DEFAULT_WAV_FILE):
-    with open(DEFAULT_WAV_FILE, "r", encoding="utf-8") as f:
-        configured_default = f.read().strip()
-
-if configured_default:
-    wav_lookup = {f.casefold(): f for f in wav_files}
-    wav_filename = wav_lookup.get(configured_default.casefold())
-    if wav_filename is None:
-        raise FileNotFoundError(
-            f"Configured default WAV '{configured_default}' was not found in:\n"
-            f"{WAV_DIR}\n\nAvailable WAV files:\n"
-            + "\n".join(f"  {f}" for f in wav_files)
-        )
+if args.file:
+    requested = os.path.expanduser(os.path.expandvars(args.file))
+    if os.path.isabs(requested) or os.path.dirname(requested):
+        WAV_FILE = requested
+        wav_filename = os.path.basename(requested)
+    else:
+        # Explicit utility files such as localisation_chirp.wav live directly
+        # in generation/. Normal orchestral parts remain in generation/wav/.
+        generation_candidate = os.path.join(GENERATION_DIR, requested)
+        if os.path.isfile(generation_candidate):
+            WAV_FILE = generation_candidate
+            wav_filename = os.path.basename(generation_candidate)
+        else:
+            wav_lookup = {f.casefold(): f for f in wav_files}
+            wav_filename = wav_lookup.get(requested.casefold())
+            if wav_filename is None:
+                raise FileNotFoundError(
+                    f"Requested WAV '{requested}' was not found in either:\n"
+                    f"  {GENERATION_DIR}\n  {WAV_DIR}"
+                )
+            WAV_FILE = os.path.join(WAV_DIR, wav_filename)
 else:
-    wav_filename = wav_files[0]
+    configured_default = ""
+    if os.path.isfile(DEFAULT_WAV_FILE):
+        with open(DEFAULT_WAV_FILE, "r", encoding="utf-8") as f:
+            configured_default = f.read().strip()
 
-WAV_FILE = os.path.join(WAV_DIR, wav_filename)
+    if configured_default:
+        wav_lookup = {f.casefold(): f for f in wav_files}
+        wav_filename = wav_lookup.get(configured_default.casefold())
+        if wav_filename is None:
+            raise FileNotFoundError(
+                f"Configured default WAV '{configured_default}' was not found in:\n"
+                f"{WAV_DIR}\n\nAvailable WAV files:\n"
+                + "\n".join(f"  {f}" for f in wav_files)
+            )
+    else:
+        wav_filename = wav_files[0]
+    WAV_FILE = os.path.join(WAV_DIR, wav_filename)
 
 
 # ============================================================

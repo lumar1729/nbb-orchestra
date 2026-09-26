@@ -367,6 +367,128 @@ def handle_binaural_command(server_ip, port, pi_name, command, stop_event):
             pass
 
 
+def handle_spatial_emit(server_ip, port, pi_name, command, stop_event):
+    """Emit one localisation chirp only after every listener reports READY."""
+    parts = command.split(":", 4)
+    if len(parts) != 5:
+        return
+    _, run_id, prepare_text, emit_text, script_command = parts
+    prepare_at, emit_at = float(prepare_text), float(emit_text)
+    chrony = read_chrony_status()
+    if not chrony["synchronized"]:
+        report_sync_result(server_ip, port, pi_name, run_id, emit_at, None,
+                           "unsynchronized", "chrony is not synchronized", chrony)
+        return
+    while time.time() < prepare_at:
+        if stop_event.is_set(): return
+        time.sleep(min(0.01, max(0.0, prepare_at-time.time())))
+    # Give listener processes time to open the microphones, then ask the server
+    # whether every expected receiver has actually posted /binaural_ready.
+    permission_at = emit_at - 0.20
+    while time.time() < permission_at:
+        if stop_event.is_set(): return
+        time.sleep(min(0.01, max(0.0, permission_at-time.time())))
+    try:
+        reply = json.loads(http_post(server_ip, port, "/spatial_emit_permission", {
+            "id": pi_name, "run": run_id
+        }))
+    except Exception as error:
+        report_sync_result(server_ip, port, pi_name, run_id, emit_at, None,
+                           "cancelled", f"emission permission failed: {error}", chrony)
+        return
+    if not reply.get("ok"):
+        report_sync_result(server_ip, port, pi_name, run_id, emit_at, None,
+                           "cancelled", reply.get("error", "listeners not ready"), chrony)
+        return
+    result = run_audio_checkpoint(script_command, emit_at, stop_event)
+    if result is not None:
+        report_sync_result(server_ip, port, pi_name, run_id, emit_at,
+                           result.get("checkpoint_at"), result["status"],
+                           result["output"], chrony, audio_result=result)
+
+
+# ----------------- Assignment helpers -----------------
+GENERATION_DIR = os.path.join(
+    os.path.expanduser("~"), "NoBlackBoxes", "LastBlackBox", "boxes", "audio",
+    "signal-processing", "python", "generation")
+WAV_DIR = os.path.join(GENERATION_DIR, "wav")
+DEFAULT_WAV_FILE = os.path.join(GENERATION_DIR, "default_wav.txt")
+SPATIAL_SIT_OUT_EXIT_CODE = 20
+
+
+def local_wavs():
+    if not os.path.isdir(WAV_DIR):
+        return []
+    # The calibration chirp is infrastructure, never an orchestral role.
+    return sorted(
+        f for f in os.listdir(WAV_DIR)
+        if f.lower().endswith(".wav")
+        and f.casefold() != "localisation_chirp.wav"
+        and os.path.isfile(os.path.join(WAV_DIR, f))
+    )
+
+
+def handle_spatial_inventory(server_ip, port, pi_name, command):
+    parts = command.split(":", 1)
+    if len(parts) != 2:
+        return
+    http_post(server_ip, port, "/spatial_inventory", {
+        "id": pi_name, "session": parts[1], "wavs": json.dumps(local_wavs())
+    })
+
+
+def handle_spatial_assignment(server_ip, port, pi_name, command, stop_event):
+    parts = command.split(":", 2)
+    if len(parts) != 3:
+        return
+    session_id, encoded = parts[1], parts[2]
+    payload = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode("utf-8"))
+    wav = payload.get("wav")
+    if wav:
+        if wav not in local_wavs():
+            raise RuntimeError(f"Server assigned unavailable WAV: {wav}")
+        with open(DEFAULT_WAV_FILE, "w", encoding="utf-8") as f:
+            f.write(wav + "\n")
+        http_post(server_ip, port, "/spatial_assignment_ack", {
+            "id": pi_name, "session": session_id, "wav": wav, "status": "ok"
+        })
+        return
+
+    http_post(server_ip, port, "/spatial_assignment_ack", {
+        "id": pi_name, "session": session_id, "wav": "", "status": "sitout"
+    })
+    # Match assign_wavs.py semantics: an excess Pi leaves the message server.
+    stop_event.set()
+    os._exit(SPATIAL_SIT_OUT_EXIT_CODE)
+
+
+def handle_assign_command(server_ip, port, pi_name, command, stop_event):
+    """Restore the existing assign_wavs.py synchronized path."""
+    parts = command.split(":", 4)
+    if len(parts) != 5:
+        return
+    _, run_id, stamp_text, session_id, script_command = parts
+    target = float(stamp_text)
+    while time.time() < target:
+        if stop_event.is_set():
+            return
+        time.sleep(min(0.01, max(0.0, target-time.time())))
+    words = [os.path.expandvars(os.path.expanduser(w)) for w in shlex.split(script_command)]
+    words += ["--server", server_ip, "--port", str(port), "--name", pi_name,
+              "--session", session_id]
+    proc = subprocess.run(words, cwd=COMMAND_CWD, capture_output=True, text=True,
+                          timeout=COMMAND_TIMEOUT)
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    chrony = read_chrony_status()
+    report_sync_result(server_ip, port, pi_name, run_id, target, target,
+                       "ok" if proc.returncode in (0, 20) else "error", output, chrony)
+    if output:
+        http_post(server_ip, port, "/post_result", {"id": pi_name, "message": output})
+    if proc.returncode == 20:
+        stop_event.set()
+        os._exit(20)
+
+
 # ----------------- Scheduled runs: run at an EXACT server-clock time --------
 def get_board(server_ip, port, since):
     # Returns every public board entry AFTER number "since" (new ones only)
@@ -716,8 +838,16 @@ def poller(server_ip, port, pi_name, stop_event):
             last_prtt = (time.perf_counter() - tick) * 1000
             if command and command.startswith("__audio__"):
                 handle_audio_command(server_ip, port, pi_name, command, stop_event)
+            elif command and command.startswith("__spatial_emit__"):
+                handle_spatial_emit(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__binaural__"):
                 handle_binaural_command(server_ip, port, pi_name, command, stop_event)
+            elif command and command.startswith("__spatial_inventory__"):
+                handle_spatial_inventory(server_ip, port, pi_name, command)
+            elif command and command.startswith("__spatial_assignment__"):
+                handle_spatial_assignment(server_ip, port, pi_name, command, stop_event)
+            elif command and command.startswith("__assign__"):
+                handle_assign_command(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__bench__"):
                 handle_benchmark_command(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__at__"):
