@@ -32,11 +32,13 @@ def suppress_stderr():
 # SETTINGS
 # ============================================================
 
-# Change this to the WAV file you want to play.
-WAV_FILE = (
+# WAV library and per-Pi default WAV configuration.
+GENERATION_DIR = (
     f"{Config.repo_path}/boxes/audio/signal-processing/"
-    f"python/generation/wav/Choir.wav"
+    f"python/generation"
 )
+WAV_DIR = os.path.join(GENERATION_DIR, "wav")
+DEFAULT_WAV_FILE = os.path.join(GENERATION_DIR, "default_wav.txt")
 
 # Speaker settings
 OUTPUT_DEVICE_NAME = "MAX"
@@ -70,6 +72,40 @@ args = parser.parse_args()
 
 if not 0 <= args.volume <= 100:
     parser.error("Volume must be between 0 and 100.")
+
+
+# ============================================================
+# SELECT WAV FILE
+# ============================================================
+
+if not os.path.isdir(WAV_DIR):
+    raise FileNotFoundError(f"WAV directory not found:\n{WAV_DIR}")
+
+wav_files = sorted(
+    (f for f in os.listdir(WAV_DIR) if f.lower().endswith(".wav")),
+    key=str.casefold,
+)
+if not wav_files:
+    raise FileNotFoundError(f"No WAV files found in:\n{WAV_DIR}")
+
+configured_default = ""
+if os.path.isfile(DEFAULT_WAV_FILE):
+    with open(DEFAULT_WAV_FILE, "r", encoding="utf-8") as f:
+        configured_default = f.read().strip()
+
+if configured_default:
+    wav_lookup = {f.casefold(): f for f in wav_files}
+    wav_filename = wav_lookup.get(configured_default.casefold())
+    if wav_filename is None:
+        raise FileNotFoundError(
+            f"Configured default WAV '{configured_default}' was not found in:\n"
+            f"{WAV_DIR}\n\nAvailable WAV files:\n"
+            + "\n".join(f"  {f}" for f in wav_files)
+        )
+else:
+    wav_filename = wav_files[0]
+
+WAV_FILE = os.path.join(WAV_DIR, wav_filename)
 
 
 # ============================================================

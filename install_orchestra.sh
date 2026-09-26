@@ -7,20 +7,34 @@ set -euo pipefail
 #   ~/NoBlackBoxes/LastBlackBox
 #
 # Usage:
-#   sudo ./install_orchestra.sh <server-ip-or-hostname>
-#
-# Example:
-#   sudo ./install_orchestra.sh 192.168.1.115
+#   sudo ./install_orchestra.sh <server-ip-or-hostname> [-d|--default <wav-file>]
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: sudo $0 <server-ip-or-hostname>"
-    echo
-    echo "Example:"
+usage() {
+    echo "Usage: sudo $0 <server-ip-or-hostname> [-d|--default <wav-file>]"
+    echo "Examples:"
     echo "  sudo $0 192.168.1.115"
-    exit 1
+    echo "  sudo $0 192.168.1.115 -d Choir.wav"
+}
+
+if [[ $# -lt 1 ]]; then usage; exit 1; fi
+SERVER_HOST="$1"
+shift
+DEFAULT_WAV=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--default)
+            [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a WAV filename."; exit 1; }
+            DEFAULT_WAV="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: Unknown argument: $1"; usage; exit 1 ;;
+    esac
+done
+
+if [[ -n "$DEFAULT_WAV" && "${DEFAULT_WAV,,}" != *.wav ]]; then
+    DEFAULT_WAV="${DEFAULT_WAV}.wav"
 fi
 
-SERVER_HOST="$1"
 RAW_BASE_URL="https://raw.githubusercontent.com/lumar1729/nbb-orchestra/main"
 
 if [[ "$EUID" -ne 0 ]]; then
@@ -42,6 +56,9 @@ if [[ -z "$ORCHESTRA_HOME" || ! -d "$ORCHESTRA_HOME" ]]; then
 fi
 
 LBB_ROOT="$ORCHESTRA_HOME/NoBlackBoxes/LastBlackBox"
+GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/python/generation"
+WAV_DIR="$GENERATION_DIR/wav"
+DEFAULT_WAV_FILE="$GENERATION_DIR/default_wav.txt"
 
 echo "========================================"
 echo " No Black Boxes Orchestra Installer"
@@ -50,6 +67,11 @@ echo
 echo "User:   $ORCHESTRA_USER"
 echo "Home:   $ORCHESTRA_HOME"
 echo "Server: $SERVER_HOST"
+if [[ -n "$DEFAULT_WAV" ]]; then
+    echo "Default WAV: $DEFAULT_WAV"
+else
+    echo "Default WAV: first WAV alphabetically"
+fi
 echo
 
 if [[ ! -d "$LBB_ROOT" ]]; then
@@ -132,12 +154,47 @@ sudo -u "$ORCHESTRA_USER" \
 echo
 
 echo "========================================"
+echo " Configure default WAV"
+echo "========================================"
+mapfile -t WAV_FILES < <(
+    find "$WAV_DIR" -maxdepth 1 -type f -iname '*.wav' -printf '%f\n' | sort -f
+)
+if [[ ${#WAV_FILES[@]} -eq 0 ]]; then
+    echo "ERROR: No WAV files were found in: $WAV_DIR"
+    exit 1
+fi
+
+if [[ -n "$DEFAULT_WAV" ]]; then
+    SELECTED_WAV=""
+    for wav in "${WAV_FILES[@]}"; do
+        if [[ "${wav,,}" == "${DEFAULT_WAV,,}" ]]; then
+            SELECTED_WAV="$wav"; break
+        fi
+    done
+    if [[ -z "$SELECTED_WAV" ]]; then
+        echo "ERROR: Requested default WAV was not found: $DEFAULT_WAV"
+        echo "Available WAV files:"
+        printf '  %s\n' "${WAV_FILES[@]}"
+        exit 1
+    fi
+else
+    SELECTED_WAV="${WAV_FILES[0]}"
+fi
+
+printf '%s\n' "$SELECTED_WAV" > "$DEFAULT_WAV_FILE"
+chown "$ORCHESTRA_USER:$ORCHESTRA_USER" "$DEFAULT_WAV_FILE"
+echo "Default WAV: $SELECTED_WAV"
+echo "Saved to: $DEFAULT_WAV_FILE"
+echo
+
+echo "========================================"
 echo " Orchestra installation complete"
 echo "========================================"
 echo
 echo "Installed for: $ORCHESTRA_USER"
 echo "LastBlackBox:  $LBB_ROOT"
 echo "Server:        $SERVER_HOST"
+echo "Default WAV:   $SELECTED_WAV"
 echo
 echo "Chrony status:"
 echo "  chronyc tracking"
