@@ -31,7 +31,20 @@ if [[ $# -ne 1 ]]; then
 fi
 
 SERVER_HOST="$1"
-PI_CLIENT="$HOME/pi_message_client.py"
+
+# Under sudo, $HOME may point to /root. Use the invoking user's real home.
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+else
+    USER_HOME="$HOME"
+fi
+
+if [[ -z "$USER_HOME" || ! -d "$USER_HOME" ]]; then
+    echo "ERROR: Could not determine the invoking user's home directory."
+    exit 1
+fi
+
+PI_CLIENT="$USER_HOME/pi_message_client.py"
 
 echo "========================================"
 echo " No Black Boxes Chrony Setup"
@@ -73,7 +86,7 @@ echo
 # Use the same Python interpreter/environment that the existing Pi setup
 # expects when available. The client itself only uses the Python standard
 # library, so fall back to python3 if the LBB environment is unavailable.
-LBB_PYTHON="$HOME/NoBlackBoxes/LastBlackBox/_tmp/LBB/bin/python"
+LBB_PYTHON="$USER_HOME/NoBlackBoxes/LastBlackBox/_tmp/LBB/bin/python"
 
 if [[ -x "$LBB_PYTHON" ]]; then
     PYTHON="$LBB_PYTHON"
