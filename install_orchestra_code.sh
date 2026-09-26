@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install/update the two orchestra Python files on an existing
+# Install/update the orchestra Python files on an existing
 # No Black Boxes installation.
 #
 # Usage:
@@ -23,9 +23,11 @@ PI_CLIENT_DEST="$HOME/pi_message_client.py"
 LBB_ROOT="$HOME/NoBlackBoxes/LastBlackBox"
 GENERATION_DIR="$LBB_ROOT/boxes/audio/signal-processing/python/generation"
 PLAY_WAV_DEST="$GENERATION_DIR/play_wav.py"
+ASSIGN_WAVS_DEST="$GENERATION_DIR/assign_wavs.py"
 
 PI_CLIENT_SOURCE="$RAW_BASE_URL/pi_message_client.py"
 PLAY_WAV_SOURCE="$RAW_BASE_URL/play_wav.py"
+ASSIGN_WAVS_SOURCE="$RAW_BASE_URL/assign_wavs.py"
 
 echo "========================================"
 echo " No Black Boxes Orchestra Code Setup"
@@ -76,6 +78,7 @@ download_file() {
 
 download_file "$PI_CLIENT_SOURCE" "$TMP_DIR/pi_message_client.py" "pi_message_client.py"
 download_file "$PLAY_WAV_SOURCE" "$TMP_DIR/play_wav.py" "play_wav.py"
+download_file "$ASSIGN_WAVS_SOURCE" "$TMP_DIR/assign_wavs.py" "assign_wavs.py"
 
 if ! grep -qE '^#!|import |from ' "$TMP_DIR/pi_message_client.py"; then
     echo "WARNING: pi_message_client.py does not look like a Python source file."
@@ -83,6 +86,10 @@ fi
 
 if ! grep -qE '^#!|import |from ' "$TMP_DIR/play_wav.py"; then
     echo "WARNING: play_wav.py does not look like a Python source file."
+fi
+
+if ! grep -qE '^#!|import |from ' "$TMP_DIR/assign_wavs.py"; then
+    echo "WARNING: assign_wavs.py does not look like a Python source file."
 fi
 
 backup_file() {
@@ -96,13 +103,16 @@ backup_file() {
 
 backup_file "$PI_CLIENT_DEST"
 backup_file "$PLAY_WAV_DEST"
+backup_file "$ASSIGN_WAVS_DEST"
 
 install -m 755 "$TMP_DIR/pi_message_client.py" "$PI_CLIENT_DEST"
 install -m 755 "$TMP_DIR/play_wav.py" "$PLAY_WAV_DEST"
+install -m 755 "$TMP_DIR/assign_wavs.py" "$ASSIGN_WAVS_DEST"
 
 echo
 echo "Installed:"
 echo "  $PI_CLIENT_DEST"
 echo "  $PLAY_WAV_DEST"
+echo "  $ASSIGN_WAVS_DEST"
 echo
 echo "Orchestra code setup complete."

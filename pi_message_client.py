@@ -643,6 +643,66 @@ def handle_audio_command(server_ip, port, pi_name, command, stop_event):
             pass
 
 
+def handle_assignment_command(server_ip, port, pi_name, command, stop_event):
+    """Run assign_wavs.py at the synchronized start time with session metadata."""
+    parts = command.split(":", 4)
+    if len(parts) != 5 or parts[0] != "__assign__":
+        return
+    run_id, stamp_text, session_id, script_command = parts[1:]
+    try:
+        target = float(stamp_text)
+    except ValueError:
+        return
+    chrony = read_chrony_status()
+    if not chrony["synchronized"]:
+        report_sync_result(server_ip, port, pi_name, run_id, target, None,
+                           "unsynchronized", "chrony is not synchronized", chrony)
+        return
+    coarse = target - time.time() - SYNC_SPIN_MARGIN
+    if coarse > 0:
+        stop_event.wait(coarse)
+        if stop_event.is_set():
+            return
+    while time.time() < target:
+        pass
+    executed_at = time.time()
+    words = [os.path.expandvars(os.path.expanduser(w)) for w in shlex.split(script_command)]
+    if (len(words) < 2 or not is_allowed_program(words[0]) or
+            not words[1].endswith("assign_wavs.py")):
+        result = "(assignment command must be: python .../assign_wavs.py)"
+        status = "rejected"
+    else:
+        words += ["--server", server_ip, "--port", str(port),
+                  "--name", pi_name, "--session", session_id]
+        try:
+            process = subprocess.Popen(words, cwd=COMMAND_CWD, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True,
+                                       start_new_session=(os.name == "posix"))
+            register_process(process)
+            try:
+                stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT)
+            finally:
+                unregister_process(process)
+            result = ((stdout or "") + (stderr or "")).strip() or "(assignment completed)"
+            if process.returncode == 20:
+                # assign_wavs.py uses exit code 20 when this Pi has no part.
+                # /assign_sitout has already posted "Bye chat!" and removed
+                # us from the server roster. Do NOT send another HTTP request
+                # here, because touch_pi() would register this Pi again.
+                print("Bye chat!", flush=True)
+                stop_event.set()
+                os._exit(0)
+            status = "ok" if process.returncode == 0 else "error"
+        except (OSError, subprocess.SubprocessError) as error:
+            result, status = str(error), "error"
+    report_sync_result(server_ip, port, pi_name, run_id, target, executed_at,
+                       status, result, chrony)
+    try:
+        http_post(server_ip, port, "/post_result", {"id": pi_name, "message": result})
+    except OSError:
+        pass
+
+
 def handle_sync_run(server_ip, port, pi_name, command, stop_event):
     """Run at the server's UTC instant, measured by the chrony-disciplined Pi."""
     parts = command.split(":", 3)
@@ -745,6 +805,8 @@ def poller(server_ip, port, pi_name, stop_event):
             last_prtt = (time.perf_counter() - tick) * 1000
             if command and command.startswith("__audio__"):
                 handle_audio_command(server_ip, port, pi_name, command, stop_event)
+            elif command and command.startswith("__assign__"):
+                handle_assignment_command(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__bench__"):
                 handle_benchmark_command(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__at__"):
