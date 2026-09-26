@@ -36,8 +36,6 @@ import socket
 import sys
 import time       # perf_counter times each poll for the Pi->server lag
 import base64
-import http.server
-import socketserver
 
 import os
 import shutil
@@ -60,72 +58,6 @@ SYNC_SPIN_MARGIN = 0.05  # Last 50ms before a scheduled run are a BUSY-SPIN:
 # Working directory used for commands sent from the server. It is persistent
 # for the lifetime of the client process; `cd` updates it.
 COMMAND_CWD = None
-CONTROL_PORT_OFFSET = 1
-command_processes = set()
-command_process_lock = threading.Lock()
-
-
-def register_process(process):
-    with command_process_lock:
-        command_processes.add(process)
-
-
-def unregister_process(process):
-    with command_process_lock:
-        command_processes.discard(process)
-
-
-def terminate_command_process(process):
-    """Terminate one command process and its Pi-side descendants."""
-    try:
-        if os.name == "posix":
-            os.killpg(os.getpgid(process.pid), 15)
-        else:
-            process.terminate()
-    except (OSError, ProcessLookupError):
-        try:
-            process.terminate()
-        except OSError:
-            pass
-
-
-def kill_command_processes():
-    with command_process_lock:
-        processes = list(command_processes)
-    for process in processes:
-        terminate_command_process(process)
-    return len(processes)
-
-
-# Server-initiated control listener. It runs on a separate thread/port so a
-# long-running command cannot prevent the client from receiving a kill request.
-class ControlHandler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        if self.path == "/kill_all":
-            count = kill_command_processes()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": True, "killed": count}).encode("utf-8"))
-            return
-        self.send_response(404)
-        self.end_headers()
-
-    def log_message(self, *_args):
-        pass
-
-
-def start_control_listener():
-    port = CONTROL_PORT_OFFSET
-    # The caller supplies the actual base port through the closure below.
-    def serve(base_port):
-        try:
-            socketserver.ThreadingTCPServer.allow_reuse_address = True
-            with socketserver.ThreadingTCPServer(("", base_port + 1), ControlHandler) as server:
-                server.serve_forever()
-        except OSError:
-            pass
-    return serve
 # a remote shell for strangers on the network. Add more if you need them!
 ALLOWED_COMMANDS = [
     "uptime", "hostname", "whoami", "date", "ls", "pwd",
@@ -245,11 +177,10 @@ CHRONY_SETUP_TIMEOUT = 20.0
 
 
 def setup_chrony(server_host):
-    """Configure this Pi to use the Windows host as its sole NTP source.
+    """Configure this Pi to use the Windows host as its LAN NTP source.
 
-    Existing server/pool directives are preserved as comments so they can be
-    recovered manually, but they are disabled while orchestra timing is active.
-    Setup succeeds only after chrony actually selects the requested server.
+    This is deliberately explicit and one-time. It refuses to run without root,
+    preserves the original configuration, and never removes other sources.
     """
     if os.name != "posix" or os.geteuid() != 0:
         raise PermissionError(
@@ -260,52 +191,28 @@ def setup_chrony(server_host):
     if not shutil.which("chronyc") or not shutil.which("systemctl"):
         raise RuntimeError("install chrony first: sudo apt install chrony")
 
-    server_ip = resolve_host(server_host)
-
     backup = f"{CHRONY_CONFIG}.pi-message-board.bak"
     if not os.path.exists(backup):
         shutil.copy2(CHRONY_CONFIG, backup)
-
     with open(CHRONY_CONFIG, encoding="utf-8") as config_file:
         config = config_file.read()
-
     config = re.sub(
         rf"(?ms)^\s*{re.escape(CHRONY_MARKER)}:.*?^\s*{re.escape(CHRONY_MARKER)} end\s*\n?",
         "", config)
-
-    lines = []
-    disabled_prefix = "# orchestra-disabled: "
-    for line in config.splitlines():
-        stripped = line.lstrip()
-
-        # Restore lines disabled by a previous run before disabling sources
-        # again. This keeps repeated setup runs clean and idempotent.
-        if stripped.startswith(disabled_prefix):
-            indent = line[:len(line) - len(stripped)]
-            line = indent + stripped[len(disabled_prefix):]
-            stripped = line.lstrip()
-
-        if stripped.startswith(("server ", "pool ", "peer ")):
-            indent = line[:len(line) - len(stripped)]
-            line = indent + disabled_prefix + stripped
-
-        lines.append(line)
-
-    config = "\n".join(lines).rstrip() + "\n"
-    source_line = f"server {server_ip} iburst minpoll 4 maxpoll 6"
-    config += (
-        f"\n{CHRONY_MARKER}: Windows message-board server\n"
-        f"{source_line}\n"
-        f"{CHRONY_MARKER} end\n")
-
+    source_line = f"server {server_host} iburst minpoll 4 maxpoll 6"
+    if source_line not in config:
+        config += (
+            f"\n{CHRONY_MARKER}: Windows message-board server\n"
+            f"{source_line}\n"
+            f"{CHRONY_MARKER} end\n")
     with open(CHRONY_CONFIG, "w", encoding="utf-8") as config_file:
         config_file.write(config)
-
     try:
         subprocess.run(["systemctl", "restart", "chrony"], check=True,
                        capture_output=True, text=True, timeout=10)
         subprocess.run(["chronyc", "online"], check=True,
                        capture_output=True, text=True, timeout=5)
+        # Correct a large startup offset only during explicit setup.
         subprocess.run(["chronyc", "makestep"], check=False,
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as error:
@@ -314,15 +221,13 @@ def setup_chrony(server_host):
     deadline = time.monotonic() + CHRONY_SETUP_TIMEOUT
     while time.monotonic() < deadline:
         status = read_chrony_status()
-        if status["synchronized"] and status.get("source") == server_ip:
+        if status["synchronized"]:
             return status
         time.sleep(1)
-
     status = read_chrony_status()
     raise RuntimeError(
-        f"chrony did not select orchestra server {server_ip} within "
-        f"{CHRONY_SETUP_TIMEOUT:.0f} seconds; selected source: "
-        f"{status.get('source') or 'none'}. "
+        "chrony did not select a source within 20 seconds. "
+        f"last error: {status.get('error') or 'no source selected'}. "
         "Check that Windows serves NTP on UDP/123 and that the Pi can reach it.")
 
 
@@ -369,24 +274,13 @@ def run_audio_checkpoint(command, target, stop_event):
     env = dict(os.environ)
     env.update({"LBB_AUDIO_READY_FD": str(ready_w), "LBB_AUDIO_GO_FD": str(go_r)})
     try:
-        process_started_at = time.time()
         proc = subprocess.Popen(words, cwd=COMMAND_CWD, env=env,
                                 pass_fds=(ready_w, go_r), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True,
-                                start_new_session=(os.name == "posix"))
-        register_process(proc)
+                                stderr=subprocess.PIPE, text=True)
         os.close(ready_w)
         os.close(go_r)
         os.read(ready_r, 6)
-        ready_at = time.time()
         os.close(ready_r)
-        if ready_at >= target:
-            proc.terminate()
-            return {"output": "(audio preparation missed playback time)",
-                    "process_started_at": process_started_at, "ready_at": ready_at,
-                    "checkpoint_at": None, "trigger_error_ms": None,
-                    "preparation_ms": (ready_at - process_started_at) * 1000,
-                    "checkpoint_error_ms": None, "status": "preparation-missed"}
         while time.time() < target:
             if stop_event.is_set():
                 proc.terminate()
@@ -399,11 +293,7 @@ def run_audio_checkpoint(command, target, stop_event):
         checkpoint = next((float(line.split(":", 1)[1]) for line in text.splitlines()
                            if line.startswith("AUDIO_CHECKPOINT:")), None)
         return {"output": text.strip() or "(audio produced no output)",
-                "process_started_at": process_started_at, "ready_at": ready_at,
                 "checkpoint_at": checkpoint,
-                "preparation_ms": (ready_at - process_started_at) * 1000,
-                "go_received_at": next((float(line.split(":", 1)[1]) for line in text.splitlines()
-                                        if line.startswith("AUDIO_GO_RECEIVED:")), None),
                 "trigger_error_ms": (trigger_at - target) * 1000,
                 "checkpoint_error_ms": ((checkpoint - target) * 1000
                                          if checkpoint is not None else None),
@@ -412,6 +302,71 @@ def run_audio_checkpoint(command, target, stop_event):
         return {"output": str(error), "checkpoint_at": None,
                 "trigger_error_ms": (time.time() - target) * 1000,
                 "checkpoint_error_ms": None, "status": "error"}
+
+
+# ----------------- Binaural localisation execution -----------------
+def run_binaural_test(command, server_ip, port, pi_name, run_id, target, stop_event):
+    """Start the microphone script before target; it records through target itself."""
+    words = [os.path.expandvars(os.path.expanduser(w)) for w in shlex.split(command)]
+    if not words or "binaural_chirp_test.py" not in " ".join(words):
+        return {"status": "error", "output": "not a binaural test command"}
+
+    env = dict(os.environ)
+    env.update({
+        "LBB_BINAURAL_SERVER": str(server_ip),
+        "LBB_BINAURAL_PORT": str(port),
+        "LBB_BINAURAL_PI_NAME": str(pi_name),
+        "LBB_BINAURAL_RUN_ID": str(run_id),
+        "LBB_BINAURAL_EMIT_AT": f"{target:.9f}",
+    })
+
+    try:
+        proc = subprocess.Popen(
+            words, cwd=COMMAND_CWD, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        output = ((stdout or "") + (stderr or "")).strip()
+        return {
+            "status": "ok" if proc.returncode == 0 else "error",
+            "output": output or "(binaural test produced no output)",
+        }
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"status": "error", "output": str(error)}
+
+
+def handle_binaural_command(server_ip, port, pi_name, command, stop_event):
+    parts = command.split(":", 4)
+    if len(parts) != 5 or parts[0] != "__binaural__":
+        return
+    run_id, prepare_text, emit_text, script_command = parts[1:]
+    prepare_at, emit_at = float(prepare_text), float(emit_text)
+
+    chrony = read_chrony_status()
+    if not chrony["synchronized"]:
+        report_sync_result(
+            server_ip, port, pi_name, run_id, emit_at, None,
+            "unsynchronized", "chrony is not synchronized", chrony
+        )
+        return
+
+    while time.time() < prepare_at:
+        if stop_event.is_set():
+            return
+        time.sleep(min(0.01, max(0.0, prepare_at - time.time())))
+
+    result = run_binaural_test(
+        script_command, server_ip, port, pi_name, run_id, emit_at, stop_event
+    )
+    # The detailed acoustic result is posted by binaural_chirp_test.py itself.
+    # This keeps the normal private command feed useful for diagnostics/errors.
+    try:
+        http_post(server_ip, port, "/post_result", {
+            "id": pi_name,
+            "message": result["output"],
+        })
+    except OSError:
+        pass
 
 
 # ----------------- Scheduled runs: run at an EXACT server-clock time --------
@@ -485,17 +440,13 @@ def run_command(command):
                 ]
         else:
             invocation = ["bash", "-ic", "Activate"] if words[0] == "Activate" else words
-        process = subprocess.Popen(invocation, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=True, cwd=COMMAND_CWD,
-                                   start_new_session=(os.name == "posix"))
-        register_process(process)
-        try:
-            output, error = process.communicate(timeout=COMMAND_TIMEOUT)
-        finally:
-            unregister_process(process)
-        text = (output or "") + (error or "")
-        if process.returncode != 0:
-            text = (f"(exit status {process.returncode})\n" + text).strip()
+        output = subprocess.run(
+            invocation, capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
+            cwd=COMMAND_CWD
+        )
+        text = output.stdout + output.stderr
+        if output.returncode != 0:
+            text = (f"(exit status {output.returncode})\n" + text).strip()
         return text.strip() or "(command produced no output)"
     except subprocess.TimeoutExpired as error:
         stdout = error.stdout or ""
@@ -532,8 +483,7 @@ def run_benchmark_once(command, intended_at, executed_at, stop_event):
         proc = subprocess.Popen([words[0], "-c", wrapper] + words[1:],
                                 cwd=COMMAND_CWD, pass_fds=(write_fd,),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=(os.name == "posix"))
-        register_process(proc)
+                                text=True)
         os.close(write_fd)
         os.read(read_fd, 5)
         ready = time.time()
@@ -587,10 +537,6 @@ def report_sync_result(server_ip, port, pi_name, run_id, intended_at, executed_a
             "audio_trigger_error_ms": audio_result.get("trigger_error_ms"),
             "audio_checkpoint_error_ms": audio_result.get("checkpoint_error_ms"),
             "audio_checkpoint_at": audio_result.get("checkpoint_at"),
-            "audio_preparation_ms": audio_result.get("preparation_ms"),
-            "audio_process_started_at": audio_result.get("process_started_at"),
-            "audio_ready_at": audio_result.get("ready_at"),
-            "audio_go_received_at": audio_result.get("go_received_at"),
         })
 
     if chrony:
@@ -668,66 +614,6 @@ def handle_audio_command(server_ip, port, pi_name, command, stop_event):
             http_post(server_ip, port, "/post_result", {"id": pi_name, "message": result["output"]})
         except OSError:
             pass
-
-
-def handle_assignment_command(server_ip, port, pi_name, command, stop_event):
-    """Run assign_wavs.py at the synchronized start time with session metadata."""
-    parts = command.split(":", 4)
-    if len(parts) != 5 or parts[0] != "__assign__":
-        return
-    run_id, stamp_text, session_id, script_command = parts[1:]
-    try:
-        target = float(stamp_text)
-    except ValueError:
-        return
-    chrony = read_chrony_status()
-    if not chrony["synchronized"]:
-        report_sync_result(server_ip, port, pi_name, run_id, target, None,
-                           "unsynchronized", "chrony is not synchronized", chrony)
-        return
-    coarse = target - time.time() - SYNC_SPIN_MARGIN
-    if coarse > 0:
-        stop_event.wait(coarse)
-        if stop_event.is_set():
-            return
-    while time.time() < target:
-        pass
-    executed_at = time.time()
-    words = [os.path.expandvars(os.path.expanduser(w)) for w in shlex.split(script_command)]
-    if (len(words) < 2 or not is_allowed_program(words[0]) or
-            not words[1].endswith("assign_wavs.py")):
-        result = "(assignment command must be: python .../assign_wavs.py)"
-        status = "rejected"
-    else:
-        words += ["--server", server_ip, "--port", str(port),
-                  "--name", pi_name, "--session", session_id]
-        try:
-            process = subprocess.Popen(words, cwd=COMMAND_CWD, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, text=True,
-                                       start_new_session=(os.name == "posix"))
-            register_process(process)
-            try:
-                stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT)
-            finally:
-                unregister_process(process)
-            result = ((stdout or "") + (stderr or "")).strip() or "(assignment completed)"
-            if process.returncode == 20:
-                # assign_wavs.py uses exit code 20 when this Pi has no part.
-                # /assign_sitout has already posted "Bye chat!" and removed
-                # us from the server roster. Do NOT send another HTTP request
-                # here, because touch_pi() would register this Pi again.
-                print("Bye chat!", flush=True)
-                stop_event.set()
-                os._exit(0)
-            status = "ok" if process.returncode == 0 else "error"
-        except (OSError, subprocess.SubprocessError) as error:
-            result, status = str(error), "error"
-    report_sync_result(server_ip, port, pi_name, run_id, target, executed_at,
-                       status, result, chrony)
-    try:
-        http_post(server_ip, port, "/post_result", {"id": pi_name, "message": result})
-    except OSError:
-        pass
 
 
 def handle_sync_run(server_ip, port, pi_name, command, stop_event):
@@ -832,8 +718,8 @@ def poller(server_ip, port, pi_name, stop_event):
             last_prtt = (time.perf_counter() - tick) * 1000
             if command and command.startswith("__audio__"):
                 handle_audio_command(server_ip, port, pi_name, command, stop_event)
-            elif command and command.startswith("__assign__"):
-                handle_assignment_command(server_ip, port, pi_name, command, stop_event)
+            elif command and command.startswith("__binaural__"):
+                handle_binaural_command(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__bench__"):
                 handle_benchmark_command(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__at__"):
@@ -911,12 +797,6 @@ if __name__ == "__main__":
         print(f"   - Is {server_ip} the laptop's correct IP address?", flush=True)
         sys.exit(1)
 
-    # A separate control listener keeps Kill All responsive even while a
-    # command process is running. Its port is the message-board port + 1.
-    control_listener = threading.Thread(
-        target=start_control_listener(), args=(port,), daemon=True
-    )
-    control_listener.start()
     # A flag the main thread flips when it wants the poller to stop
     stop_event = threading.Event()
     # Start the command/board poller in a background thread. "daemon=True"
