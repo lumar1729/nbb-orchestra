@@ -245,10 +245,11 @@ CHRONY_SETUP_TIMEOUT = 20.0
 
 
 def setup_chrony(server_host):
-    """Configure this Pi to use the Windows host as its LAN NTP source.
+    """Configure this Pi to use the Windows host as its sole NTP source.
 
-    This is deliberately explicit and one-time. It refuses to run without root,
-    preserves the original configuration, and never removes other sources.
+    Existing server/pool directives are preserved as comments so they can be
+    recovered manually, but they are disabled while orchestra timing is active.
+    Setup succeeds only after chrony actually selects the requested server.
     """
     if os.name != "posix" or os.geteuid() != 0:
         raise PermissionError(
@@ -259,28 +260,52 @@ def setup_chrony(server_host):
     if not shutil.which("chronyc") or not shutil.which("systemctl"):
         raise RuntimeError("install chrony first: sudo apt install chrony")
 
+    server_ip = resolve_host(server_host)
+
     backup = f"{CHRONY_CONFIG}.pi-message-board.bak"
     if not os.path.exists(backup):
         shutil.copy2(CHRONY_CONFIG, backup)
+
     with open(CHRONY_CONFIG, encoding="utf-8") as config_file:
         config = config_file.read()
+
     config = re.sub(
         rf"(?ms)^\s*{re.escape(CHRONY_MARKER)}:.*?^\s*{re.escape(CHRONY_MARKER)} end\s*\n?",
         "", config)
-    source_line = f"server {server_host} iburst minpoll 4 maxpoll 6"
-    if source_line not in config:
-        config += (
-            f"\n{CHRONY_MARKER}: Windows message-board server\n"
-            f"{source_line}\n"
-            f"{CHRONY_MARKER} end\n")
+
+    lines = []
+    disabled_prefix = "# orchestra-disabled: "
+    for line in config.splitlines():
+        stripped = line.lstrip()
+
+        # Restore lines disabled by a previous run before disabling sources
+        # again. This keeps repeated setup runs clean and idempotent.
+        if stripped.startswith(disabled_prefix):
+            indent = line[:len(line) - len(stripped)]
+            line = indent + stripped[len(disabled_prefix):]
+            stripped = line.lstrip()
+
+        if stripped.startswith(("server ", "pool ", "peer ")):
+            indent = line[:len(line) - len(stripped)]
+            line = indent + disabled_prefix + stripped
+
+        lines.append(line)
+
+    config = "\n".join(lines).rstrip() + "\n"
+    source_line = f"server {server_ip} iburst minpoll 4 maxpoll 6"
+    config += (
+        f"\n{CHRONY_MARKER}: Windows message-board server\n"
+        f"{source_line}\n"
+        f"{CHRONY_MARKER} end\n")
+
     with open(CHRONY_CONFIG, "w", encoding="utf-8") as config_file:
         config_file.write(config)
+
     try:
         subprocess.run(["systemctl", "restart", "chrony"], check=True,
                        capture_output=True, text=True, timeout=10)
         subprocess.run(["chronyc", "online"], check=True,
                        capture_output=True, text=True, timeout=5)
-        # Correct a large startup offset only during explicit setup.
         subprocess.run(["chronyc", "makestep"], check=False,
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as error:
@@ -289,13 +314,15 @@ def setup_chrony(server_host):
     deadline = time.monotonic() + CHRONY_SETUP_TIMEOUT
     while time.monotonic() < deadline:
         status = read_chrony_status()
-        if status["synchronized"]:
+        if status["synchronized"] and status.get("source") == server_ip:
             return status
         time.sleep(1)
+
     status = read_chrony_status()
     raise RuntimeError(
-        "chrony did not select a source within 20 seconds. "
-        f"last error: {status.get('error') or 'no source selected'}. "
+        f"chrony did not select orchestra server {server_ip} within "
+        f"{CHRONY_SETUP_TIMEOUT:.0f} seconds; selected source: "
+        f"{status.get('source') or 'none'}. "
         "Check that Windows serves NTP on UDP/123 and that the Pi can reach it.")
 
 
