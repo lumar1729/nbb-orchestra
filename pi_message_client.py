@@ -911,9 +911,9 @@ def poller(server_ip, port, pi_name, stop_event):
     - Command traffic is NEVER shown: results are not on the board at all,
       and the received/executed chatter stays in the laptop's terminal only
       (hence the poller runs quietly: no print for commands/results).
-    - Two magic commands are intercepted BEFORE the whitelist: "__ping__"
-      (lag probe -> instant POST /pong) and "__at__:<run>:<T>:<cmd>" (a
-      scheduled run -> wait for T on the server's clock, run, report back).
+    - Internal protocol commands are intercepted BEFORE the whitelist, including
+      "__ping__", scheduled-run tokens, and "__mod_disconnect__". None of these
+      control tokens is ever passed to a shell.
     - Our own messages are skipped (we saw them when we typed them)."""
     own_tag = f"🤖 {pi_name}".lower()
 
@@ -932,7 +932,14 @@ def poller(server_ip, port, pi_name, stop_event):
             command, chrony = get_command(
                 server_ip, port, pi_name, last_prtt, chrony=chrony)
             last_prtt = (time.perf_counter() - tick) * 1000
-            if command and command.startswith("__audio__"):
+            if command and command.startswith("__mod_disconnect__"):
+                # Moderator control token: protocol-only, intercepted before the
+                # whitelist and NEVER passed to a shell or subprocess.
+                reason = command.split(":", 1)[1] if ":" in command else "moderator"
+                print(f"⛔ Disconnected by Moderator ({reason.replace('_', ' ')}).", flush=True)
+                stop_event.set()
+                os._exit(23)
+            elif command and command.startswith("__audio__"):
                 handle_audio_command(server_ip, port, pi_name, command, stop_event)
             elif command and command.startswith("__spatial_emit__"):
                 handle_spatial_emit(server_ip, port, pi_name, command, stop_event)
