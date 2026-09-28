@@ -454,7 +454,7 @@ def main():
         time.sleep(0.05)
     if emit_at is None:
         mic.stop()
-        raise SystemExit("Localisation emission was not armed within 15 seconds.")
+        raise SystemExit("Localisation emission was not armed within 20 seconds.")
 
     print(f"Scheduled chirp:       {emit_at:.9f}")
     print(f"Pre-roll:              {(emit_at-record_start_epoch)*1000:.1f} ms")
@@ -483,7 +483,11 @@ def main():
 
     record_stop_epoch = record_start_epoch + len(recording) / SAMPLE_RATE
     post_t_recorded_s = record_stop_epoch - emit_at
-    packet_end_after_t_s = LEADING_SILENCE_S + (BURST_CHIRP_COUNT - 1) * BURST_SPACING_S + CHIRP_DURATION_S
+    packet_end_after_t_s = (
+        NOMINAL_FIRST_CHIRP_S
+        + (BURST_CHIRP_COUNT - 1) * BURST_SPACING_S
+        + CHIRP_DURATION_S
+    )
     complete_packet = post_t_recorded_s >= packet_end_after_t_s
 
     print(f"Recording stop:        {record_stop_epoch:.9f}")
