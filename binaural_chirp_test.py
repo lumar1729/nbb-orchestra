@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 import urllib.parse
 import urllib.request
-import wave
+import soundfile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -449,37 +449,44 @@ def main():
         stop_at = emit_at + args.post_roll
         while time.time() < stop_at:
             time.sleep(0.005)
-        recording = np.copy(mic.sound)
+
+        # mic.sound is preallocated to max_samples. Only [:valid_samples] contains
+        # captured audio until that buffer fills. Take one locked snapshot and use
+        # this exact array for both analysis and WAV export.
+        with mic.mutex:
+            valid_samples = int(mic.valid_samples)
+            recording = np.copy(mic.sound[:valid_samples, :])
     finally:
         mic.stop()
 
     if recording.ndim != 2 or recording.shape[1] < 2:
         raise SystemExit(f"Expected stereo audio; got {recording.shape}")
 
-    # Save the unprocessed stereo microphone capture in the invoking user's home
-    # directory.  Keep the microphone's native signed 32-bit PCM samples: do not
-    # normalize them, because absolute level/SNR is useful when diagnosing chirp
-    # detection.  The filename includes both run and listener so files from
-    # different Pis can be copied into the same laptop directory without clashes.
+    # Sanity-check the exact snapshot that will be analysed and saved.
+    print("Raw capture:")
+    print(f"  shape: {recording.shape}")
+    print(f"  dtype: {recording.dtype}")
+    for ch, name in enumerate(("L", "R")):
+        x = recording[:, ch].astype(np.float64, copy=False)
+        rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
+        print(
+            f"  {name}: min={np.min(x):+.8f}, max={np.max(x):+.8f}, "
+            f"rms={rms:.8f}, nonzero={np.count_nonzero(x)}/{x.size}"
+        )
+
+    # Save the same normalized float32 samples used by analyse(). soundfile
+    # performs the float [-1, 1] -> signed PCM_32 conversion correctly.
     safe_run_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in run_id)
     safe_pi_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in pi_name)
     raw_wav_path = os.path.expanduser(
         f"~/binaural_raw_{safe_run_id}_{safe_pi_name}.wav"
     )
-    raw_pcm = np.asarray(recording[:, :2])
-    if raw_pcm.dtype != np.int32:
-        raw_pcm = np.clip(
-            raw_pcm, np.iinfo(np.int32).min, np.iinfo(np.int32).max
-        ).astype(np.int32)
-    with wave.open(raw_wav_path, "wb") as wav_out:
-        wav_out.setnchannels(2)
-        wav_out.setsampwidth(4)
-        wav_out.setframerate(SAMPLE_RATE)
-        wav_out.writeframes(raw_pcm.astype("<i4", copy=False).tobytes())
+    soundfile.write(
+        raw_wav_path, recording[:, :2], SAMPLE_RATE, subtype="PCM_32"
+    )
     print(f"Raw stereo WAV saved:  {raw_wav_path}")
 
-    # mic.sound contains the samples accumulated since mic.start() (up to the
-    # configured max buffer). Convert the matched-filter sample offset into the
+    # Convert the matched-filter sample offset in the captured snapshot into the
     # same Chrony-disciplined epoch used by the server.
     # Convert the scheduled playback epoch into recording-relative samples and
     # search only in the physically plausible first-chirp interval. The transmitted
