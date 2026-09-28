@@ -44,6 +44,13 @@ MIN_ITD_CORRELATION = 0.20
 DETECTION_SEARCH_START_S = 0.0
 DETECTION_SEARCH_END_S = 1.0
 
+# One localisation playback contains three identical chirps. Their known spacing
+# acts as an acoustic code: unrelated room sounds must match all three events at
+# the right intervals to win detection.
+BURST_CHIRP_COUNT = 3
+BURST_SPACING_S = 0.200
+MAX_ITD_SPREAD_US = 75.0
+
 
 @contextmanager
 def suppress_native_stderr():
@@ -171,101 +178,120 @@ def rms(x):
 
 
 def analyse(recording, ear_distance, search_start_sample=None, search_end_sample=None):
+    """Detect a coded three-chirp burst and estimate a robust median ITD.
+
+    Detection is performed independently in the two ears.  A candidate burst is
+    scored only when three copies of the known chirp occur at the transmitted
+    spacing.  ITD is then estimated independently for all three chirps and the
+    median is returned; disagreement between the three estimates is reported.
+    """
     left_full = recording[:, 0].astype(np.float64)
     right_full = recording[:, 1].astype(np.float64)
     left_full -= np.mean(left_full)
     right_full -= np.mean(right_full)
-
     reference = make_reference_chirp()
 
-    # Detect against the average of both ears. This avoids choosing one ear as
-    # privileged while giving a stronger signal than either channel alone.
-    mono = 0.5 * (left_full + right_full)
-
-    # The server tells us when playback was scheduled, so do not search the
-    # entire multi-second recording. In a noisy room, an unrelated sound can
-    # otherwise produce the largest matched-filter response. Search only the
-    # physically plausible interval supplied by main().
     if search_start_sample is None:
         search_start_sample = 0
     if search_end_sample is None:
-        search_end_sample = len(mono)
-
+        search_end_sample = len(left_full)
     search_start_sample = max(0, int(search_start_sample))
-    search_end_sample = min(len(mono), int(search_end_sample))
+    search_end_sample = min(len(left_full), int(search_end_sample))
 
-    if search_end_sample - search_start_sample < len(reference):
-        raise RuntimeError(
-            "Chirp detection search window is too short for the reference chirp: "
-            f"samples {search_start_sample}:{search_end_sample}."
-        )
+    spacing = int(round(BURST_SPACING_S * SAMPLE_RATE))
+    burst_span = (BURST_CHIRP_COUNT - 1) * spacing + len(reference)
+    if search_end_sample - search_start_sample < burst_span:
+        raise RuntimeError("Burst detection search window is too short.")
 
-    search_mono = mono[search_start_sample:search_end_sample]
-    local_chirp_start, detection_score, local_detection_curve = matched_filter(
-        search_mono, reference
-    )
-    chirp_start = search_start_sample + local_chirp_start
+    # Matched-filter each ear independently.  This avoids frequency-dependent
+    # cancellation caused by averaging two channels that contain a real ITD.
+    _, _, left_scores = matched_filter(left_full, reference)
+    _, _, right_scores = matched_filter(right_full, reference)
 
-    # Keep a full-recording-length detection curve for the existing diagnostic
-    # plot. Locations outside the allowed search interval are NaN, making the
-    # constrained search visually explicit.
-    full_curve_len = max(0, len(mono) - len(reference) + 1)
-    detection_curve = np.full(full_curve_len, np.nan, dtype=np.float64)
-    curve_start = search_start_sample
-    curve_end = min(full_curve_len, curve_start + len(local_detection_curve))
-    if curve_end > curve_start:
-        detection_curve[curve_start:curve_end] = local_detection_curve[:curve_end-curve_start]
+    first_lo = search_start_sample
+    first_hi = min(search_end_sample - burst_span + 1,
+                   len(left_scores) - (BURST_CHIRP_COUNT - 1) * spacing,
+                   len(right_scores) - (BURST_CHIRP_COUNT - 1) * spacing)
+    if first_hi <= first_lo:
+        raise RuntimeError("No complete three-chirp burst fits inside the search window.")
 
+    candidates = np.arange(first_lo, first_hi, dtype=int)
+    evidence = []
+    for k in range(BURST_CHIRP_COUNT):
+        idx = candidates + k * spacing
+        evidence.append(np.abs(left_scores[idx]))
+        evidence.append(np.abs(right_scores[idx]))
+    evidence = np.vstack(evidence)
+
+    # Median makes one unusually good accidental match insufficient: a genuine
+    # packet needs good evidence across both ears and across the three chirps.
+    burst_curve = np.median(evidence, axis=0)
+    best_local = int(np.argmax(burst_curve))
+    chirp_start = int(candidates[best_local])
+    detection_score = float(burst_curve[best_local])
+
+    chirp_starts = [chirp_start + k * spacing for k in range(BURST_CHIRP_COUNT)]
     pad = int(round(WINDOW_PAD_S * SAMPLE_RATE))
-    chirp_n = len(reference)
-    window_start = max(0, chirp_start - pad)
-    window_end = min(len(mono), chirp_start + chirp_n + pad)
-
-    left = left_full[window_start:window_end]
-    right = right_full[window_start:window_end]
-
-    # ITD from the low-frequency portion of only the detected chirp window.
-    left_itd = fft_bandpass(left, ITD_LOW_HZ, ITD_HIGH_HZ)
-    right_itd = fft_bandpass(right, ITD_LOW_HZ, ITD_HIGH_HZ)
-
     max_lag = int(np.ceil(ear_distance / SPEED_OF_SOUND * SAMPLE_RATE))
-    lags, corr = correlations_for_lags(left_itd, right_itd, max_lag)
+    itds, corrs, ilds, lag_samples_all = [], [], [], []
+    representative_lags = representative_corr = None
 
-    peak = int(np.argmax(corr))
-    refined = refine_peak(corr, peak)
-    lag_samples = lags[0] + refined
-    itd = lag_samples / SAMPLE_RATE
+    for start in chirp_starts:
+        window_start = max(0, start - pad)
+        window_end = min(len(left_full), start + len(reference) + pad)
+        left = left_full[window_start:window_end]
+        right = right_full[window_start:window_end]
 
+        left_itd = fft_bandpass(left, ITD_LOW_HZ, ITD_HIGH_HZ)
+        right_itd = fft_bandpass(right, ITD_LOW_HZ, ITD_HIGH_HZ)
+        lags, corr = correlations_for_lags(left_itd, right_itd, max_lag)
+        peak = int(np.argmax(corr))
+        refined = refine_peak(corr, peak)
+        lag_samples = lags[0] + refined
+        itd = lag_samples / SAMPLE_RATE
+
+        left_ild = fft_bandpass(left, ILD_LOW_HZ, ILD_HIGH_HZ)
+        right_ild = fft_bandpass(right, ILD_LOW_HZ, ILD_HIGH_HZ)
+        ild = 20.0 * np.log10((rms(left_ild) + 1e-12) /
+                              (rms(right_ild) + 1e-12))
+        itds.append(itd)
+        corrs.append(float(corr[peak]))
+        ilds.append(float(ild))
+        lag_samples_all.append(float(lag_samples))
+        if representative_corr is None or corr[peak] > np.max(representative_corr):
+            representative_lags, representative_corr = lags, corr
+
+    itd = float(np.median(itds))
+    lag_samples = itd * SAMPLE_RATE
+    itd_spread_us = float((max(itds) - min(itds)) * 1e6)
     bearing = float(np.degrees(np.arcsin(np.clip(
-        SPEED_OF_SOUND * itd / ear_distance, -1.0, 1.0
-    ))))
+        SPEED_OF_SOUND * itd / ear_distance, -1.0, 1.0))))
 
-    # ILD from the higher-frequency portion of the same detected window.
-    left_ild = fft_bandpass(left, ILD_LOW_HZ, ILD_HIGH_HZ)
-    right_ild = fft_bandpass(right, ILD_LOW_HZ, ILD_HIGH_HZ)
-    ild = 20.0 * np.log10(
-        (rms(left_ild) + 1e-12) / (rms(right_ild) + 1e-12)
-    )
+    # Full-length diagnostic curve: score means "three correctly-spaced chirps",
+    # not merely one local matched-filter peak.
+    detection_curve = np.full(len(left_scores), np.nan, dtype=np.float64)
+    detection_curve[candidates] = burst_curve
+    window_start = max(0, chirp_starts[0] - pad)
+    window_end = min(len(left_full), chirp_starts[-1] + len(reference) + pad)
 
     return {
-        "left_full": left_full,
-        "right_full": right_full,
-        "left": left,
-        "right": right,
+        "left_full": left_full, "right_full": right_full,
+        "left": left_full[window_start:window_end],
+        "right": right_full[window_start:window_end],
         "detection_curve": detection_curve,
-        "chirp_start": chirp_start,
-        "window_start": window_start,
-        "window_end": window_end,
-        "detection_score": abs(detection_score),
+        "chirp_start": chirp_start, "chirp_starts": chirp_starts,
+        "window_start": window_start, "window_end": window_end,
+        "detection_score": detection_score,
         "search_start_sample": search_start_sample,
         "search_end_sample": search_end_sample,
-        "lags": lags,
-        "corr": corr,
-        "lag_samples": lag_samples,
-        "itd": itd,
-        "bearing": bearing,
-        "ild": ild,
-        "itd_correlation": float(corr[peak]),
+        "lags": representative_lags, "corr": representative_corr,
+        "lag_samples": lag_samples, "itd": itd, "bearing": bearing,
+        "ild": float(np.median(ilds)),
+        "itd_correlation": float(np.median(corrs)),
+        "individual_itd_us": [v * 1e6 for v in itds],
+        "individual_correlations": corrs,
+        "individual_lag_samples": lag_samples_all,
+        "itd_spread_us": itd_spread_us,
     }
 
 
@@ -342,7 +368,7 @@ def main():
     p = argparse.ArgumentParser(
         description="Record a server-scheduled localisation chirp and estimate ToA/ITD/ILD."
     )
-    p.add_argument("--post-roll", type=float, default=0.75,
+    p.add_argument("--post-roll", type=float, default=1.5,
                    help="Seconds to continue recording after scheduled emission.")
     p.add_argument("--ear-distance", type=float, default=EAR_DISTANCE_M)
     args = p.parse_args()
@@ -437,12 +463,16 @@ def main():
     print(f"ILD (L/R):             {result['ild']:+.2f} dB")
     print(f"ITD bearing:           {result['bearing']:+.1f} degrees")
     print(f"ITD correlation:       {result['itd_correlation']:.3f}")
+    print("Per-chirp ITDs:        " + ", ".join(f"{v:+.1f} us" for v in result["individual_itd_us"]))
+    print(f"ITD spread:            {result['itd_spread_us']:.1f} us")
 
     warnings = []
     if result["detection_score"] < MIN_DETECTION_SCORE:
         warnings.append("weak chirp detection")
     if result["itd_correlation"] < MIN_ITD_CORRELATION:
         warnings.append("weak binaural correlation")
+    if result["itd_spread_us"] > MAX_ITD_SPREAD_US:
+        warnings.append(f"inconsistent three-chirp ITDs ({result['itd_spread_us']:.1f} us spread)")
     physical_max = args.ear_distance / SPEED_OF_SOUND
     if abs(result["itd"]) > 0.95 * physical_max:
         warnings.append("ITD is very close to the physical limit")
@@ -471,6 +501,8 @@ def main():
         "bearing_deg": f"{result['bearing']:.6f}",
         "detection_score": f"{result['detection_score']:.6f}",
         "itd_correlation": f"{result['itd_correlation']:.6f}",
+        "itd_spread_us": f"{result['itd_spread_us']:.6f}",
+        "individual_itd_us": ",".join(f"{v:.6f}" for v in result["individual_itd_us"]),
         "confidence": confidence,
         "warnings": "; ".join(warnings),
     }
