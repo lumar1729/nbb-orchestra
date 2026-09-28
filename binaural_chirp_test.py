@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import urllib.parse
 import urllib.request
 import soundfile
+from scipy.signal import butter, sosfiltfilt, fftconvolve, find_peaks
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,7 +19,7 @@ import NB3.Sound.microphone as Microphone
 import NB3.Sound.utilities as Utilities
 
 SAMPLE_RATE = 48000
-EAR_DISTANCE_M = 0.17
+EAR_DISTANCE_M = 0.183123  # CAD: acoustic-port to acoustic-port
 SPEED_OF_SOUND = 343.0
 
 # Must match generate_localisation_chirp.py.
@@ -42,10 +43,16 @@ MIN_ITD_CORRELATION = 0.20
 # Restrict chirp detection to a physically plausible interval after the
 # scheduled playback time. This prevents unrelated room sounds elsewhere in
 # the recording from winning the global matched-filter search.
-DETECTION_SEARCH_START_S = 0.150
-DETECTION_SEARCH_END_S = 0.750
+DETECTION_SEARCH_START_S = -0.100
+DETECTION_SEARCH_END_S = 1.500
 NOMINAL_FIRST_CHIRP_S = 0.200
 PROMINENCE_EXCLUSION_S = 0.050
+PACKET_TIMING_TOLERANCE_S = 0.030
+PACKET_TIMING_SCALE_S = 0.020
+ITD_WINDOW_BEFORE_S = 0.003
+ITD_WINDOW_DURATION_S = 0.055
+GCC_INTERPOLATION = 16
+ITD_LIMIT_MARGIN = 1.10
 
 # One localisation playback contains three identical chirps. Their known spacing
 # acts as an acoustic code: unrelated room sounds must match all three events at
@@ -69,8 +76,17 @@ def suppress_native_stderr():
         os.close(saved_stderr)
 
 
+def bandpass(x, low_hz=350.0, high_hz=9000.0):
+    """Zero-phase Butterworth band-pass used by the validated offline detector."""
+    x = np.asarray(x, dtype=np.float64)
+    high_hz = min(float(high_hz), SAMPLE_RATE * 0.49)
+    sos = butter(4, [float(low_hz), high_hz], btype="bandpass",
+                 fs=SAMPLE_RATE, output="sos")
+    return sosfiltfilt(sos, x, axis=0)
+
+
 def make_reference_chirp():
-    """Load the exact chirp samples from the WAV used for localisation playback."""
+    """Extract the first active 80-ms chirp exactly as in the offline test."""
     chirp_path = os.path.join(
         Config.repo_path,
         "boxes/audio/signal-processing/python/generation/localisation_chirp.wav",
@@ -83,112 +99,125 @@ def make_reference_chirp():
         raise RuntimeError(
             f"Localisation chirp sample rate is {fs} Hz; expected {SAMPLE_RATE} Hz"
         )
+    mono = packet.mean(axis=1)
+    smooth_n = max(1, int(0.004 * SAMPLE_RATE))
+    energy = fftconvolve(mono * mono, np.ones(smooth_n) / smooth_n, mode="same")
+    active = np.flatnonzero(energy > energy.max() * 0.03)
+    if not len(active):
+        raise RuntimeError(f"No active chirp found in localisation WAV: {chirp_path}")
 
-    # The playback file is mono in normal use. If it is ever stored with more
-    # than one channel, use the first channel explicitly rather than silently
-    # averaging potentially different signals.
-    packet = packet[:, 0]
-    start = int(round(NOMINAL_FIRST_CHIRP_S * SAMPLE_RATE))
-    stop = start + int(round(CHIRP_DURATION_S * SAMPLE_RATE))
-    if stop > len(packet):
-        raise RuntimeError(
-            f"Localisation chirp WAV is too short to extract {CHIRP_DURATION_S:.3f} s "
-            f"at t={NOMINAL_FIRST_CHIRP_S:.3f} s: {chirp_path}"
-        )
-
-    x = np.array(packet[start:stop], dtype=np.float64, copy=True)
-    x -= np.mean(x)
-    norm = np.linalg.norm(x)
-    if norm <= 0.0:
-        raise RuntimeError(f"Extracted localisation chirp is silent: {chirp_path}")
-    x /= norm
+    start = max(0, int(active[0]) - int(0.004 * SAMPLE_RATE))
+    n = int(round(CHIRP_DURATION_S * SAMPLE_RATE))
+    if start + n > len(mono):
+        raise RuntimeError("Localisation WAV is too short to extract the reference chirp.")
+    reference = bandpass(mono[start:start+n])
+    reference -= reference.mean()
+    reference /= np.linalg.norm(reference) + 1e-15
     print(f"Matched-filter reference loaded from: {chirp_path}")
-    return x
+    return reference, start / SAMPLE_RATE
 
 
-def fft_bandpass(x, low_hz, high_hz):
-    x = np.asarray(x, dtype=np.float64)
-    spectrum = np.fft.rfft(x)
-    freqs = np.fft.rfftfreq(len(x), 1.0 / SAMPLE_RATE)
-    spectrum[(freqs < low_hz) | (freqs > high_hz)] = 0
-    return np.fft.irfft(spectrum, n=len(x))
-
-
-def fft_valid_correlation(signal, reference):
-    """
-    Fast matched-filter correlation.
-
-    Returns dot products for every location at which the full reference fits
-    inside signal. Implemented with NumPy FFT so SciPy is not required.
-    """
-    signal = np.asarray(signal, dtype=np.float64)
-    reference = np.asarray(reference, dtype=np.float64)
-
-    n = len(signal) + len(reference) - 1
-    nfft = 1 << (n - 1).bit_length()
-
-    spectrum_signal = np.fft.rfft(signal, nfft)
-    spectrum_ref = np.fft.rfft(reference[::-1], nfft)
-    full = np.fft.irfft(spectrum_signal * spectrum_ref, nfft)[:n]
-
-    start = len(reference) - 1
-    stop = len(signal)
-    return full[start:stop]
-
-
-def matched_filter(signal, reference):
-    """
-    Locate the chirp and return a normalized detection score for each start time.
-    """
+def normalized_matched_filter(signal, reference):
+    """Normalized FFT matched-filter score at every possible chirp start."""
     x = np.asarray(signal, dtype=np.float64)
-    x = x - np.mean(x)
-
-    dots = fft_valid_correlation(x, reference)
-
-    # Normalize each dot product by the local signal energy. The reference has
-    # unit norm, so this is approximately a correlation coefficient.
-    sq = x * x
-    csum = np.concatenate(([0.0], np.cumsum(sq)))
-    m = len(reference)
-    local_energy = csum[m:] - csum[:-m]
-    denom = np.sqrt(np.maximum(local_energy, 1e-24))
-    scores = dots / denom
-
-    peak = int(np.argmax(np.abs(scores)))
-    return peak, float(scores[peak]), scores
+    n = len(reference)
+    corr = fftconvolve(x, reference[::-1], mode="full")[n-1:n-1+len(x)]
+    energy = fftconvolve(x*x, np.ones(n), mode="full")[n-1:n-1+len(x)]
+    return corr / (np.sqrt(np.maximum(energy, 1e-20)) *
+                   (np.linalg.norm(reference) + 1e-15))
 
 
-def correlations_for_lags(left, right, max_lag):
-    left = left - np.mean(left)
-    right = right - np.mean(right)
-    lags = np.arange(-max_lag, max_lag + 1)
-    corr = np.zeros(len(lags))
+def detect_packet(score, search_start_sample, search_end_sample):
+    """Find a three-chirp acoustic code, using the validated offline algorithm."""
+    s = np.abs(score)
+    spacing = int(round(BURST_SPACING_S * SAMPLE_RATE))
+    tolerance = int(round(PACKET_TIMING_TOLERANCE_S * SAMPLE_RATE))
+    chirp_n = int(round(CHIRP_DURATION_S * SAMPLE_RATE))
 
-    for k, lag in enumerate(lags):
-        if lag > 0:
-            a, b = left[:-lag], right[lag:]
-        elif lag < 0:
-            a, b = left[-lag:], right[:lag]
-        else:
-            a, b = left, right
+    lo = max(0, int(search_start_sample))
+    hi = min(len(s) - 2 * spacing - chirp_n, int(search_end_sample))
+    if hi <= lo:
+        raise RuntimeError("No complete three-chirp packet fits inside the search window.")
 
-        denom = np.linalg.norm(a) * np.linalg.norm(b)
-        corr[k] = np.dot(a, b) / denom if denom else 0.0
+    peaks, _ = find_peaks(s[lo:hi], distance=int(round(0.035 * SAMPLE_RATE)))
+    peaks = peaks + lo
+    if not len(peaks):
+        raise RuntimeError("No chirp candidates found in the localisation search window.")
+    peaks = peaks[np.argsort(s[peaks])[::-1]][:100]
 
-    return lags, corr
+    candidates = []
+    for p0 in peaks:
+        starts = [int(p0)]
+        scores = [float(s[p0])]
+        for k in (1, 2):
+            target = int(p0) + k * spacing
+            a = max(0, target - tolerance)
+            b = min(len(s), target + tolerance + 1)
+            if b <= a:
+                break
+            p = a + int(np.argmax(s[a:b]))
+            starts.append(p)
+            scores.append(float(s[p]))
+        if len(starts) != BURST_CHIRP_COUNT:
+            continue
+        timing_error = (abs((starts[1]-starts[0]) / SAMPLE_RATE - BURST_SPACING_S) +
+                        abs((starts[2]-starts[1]) / SAMPLE_RATE - BURST_SPACING_S))
+        strength = float(np.prod(np.maximum(scores, 1e-12)) ** (1.0/3.0))
+        objective = strength * math.exp(-timing_error / PACKET_TIMING_SCALE_S)
+        candidates.append((objective, strength, starts, scores))
+
+    if not candidates:
+        raise RuntimeError("No complete three-chirp packet found.")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best = candidates[0]
+    second = next((c for c in candidates[1:]
+                   if abs(c[2][0] - best[2][0]) > int(PROMINENCE_EXCLUSION_S*SAMPLE_RATE)),
+                  None)
+    second_score = float(second[1]) if second else 0.0
+    return best[1], second_score, best[2], best[3]
 
 
-def refine_peak(y, i):
-    if i == 0 or i == len(y) - 1:
-        return float(i)
+def gcc_phat(left, right, max_itd_s, interp=GCC_INTERPOLATION):
+    """Sub-sample GCC-PHAT; positive means the right channel is delayed."""
+    nfft = 1 << int(np.ceil(np.log2(len(left) + len(right))))
+    left_fft = np.fft.rfft(left, nfft)
+    right_fft = np.fft.rfft(right, nfft)
+    cross = left_fft * np.conj(right_fft)
+    cross /= np.maximum(np.abs(cross), 1e-15)
+    cc = np.fft.irfft(cross, nfft * interp)
+    max_shift = int(round(max_itd_s * SAMPLE_RATE * interp))
+    local = np.r_[cc[-max_shift:], cc[:max_shift+1]]
+    j = int(np.argmax(np.abs(local)))
+    shift = j - max_shift
+    y = np.abs(local)
+    frac = 0.0
+    if 0 < j < len(y)-1:
+        denom = y[j-1] - 2.0*y[j] + y[j+1]
+        if abs(denom) > 1e-15:
+            frac = 0.5 * (y[j-1] - y[j+1]) / denom
+    return -(shift + frac) / (interp * SAMPLE_RATE)
 
-    a, b, c = y[i - 1], y[i], y[i + 1]
-    denom = a - 2.0 * b + c
 
-    if abs(denom) < 1e-12:
-        return float(i)
+def itd_at(recording, start, ear_distance):
+    """Estimate one chirp's ITD from the same short window used offline."""
+    a = max(0, int(start) - int(round(ITD_WINDOW_BEFORE_S * SAMPLE_RATE)))
+    b = min(len(recording), a + int(round(ITD_WINDOW_DURATION_S * SAMPLE_RATE)))
+    z = bandpass(recording[a:b, :2])
+    left = z[:, 0] - z[:, 0].mean()
+    right = z[:, 1] - z[:, 1].mean()
+    window = np.hanning(len(left))
+    max_itd_s = ear_distance / SPEED_OF_SOUND * ITD_LIMIT_MARGIN
+    itd = gcc_phat(left * window, right * window, max_itd_s)
 
-    return i + float(np.clip(0.5 * (a - c) / denom, -1.0, 1.0))
+    lag = int(round(itd * SAMPLE_RATE))
+    if lag >= 0:
+        l = left[:-lag] if lag else left
+        r = right[lag:] if lag else right
+    else:
+        k = -lag
+        l, r = left[k:], right[:-k]
+    corr = float(np.dot(l, r) / (np.linalg.norm(l)*np.linalg.norm(r) + 1e-15))
+    return itd, corr
 
 
 def rms(x):
@@ -196,127 +225,79 @@ def rms(x):
 
 
 def analyse(recording, ear_distance, search_start_sample=None, search_end_sample=None):
-    """Locate the complete three-chirp packet, then estimate ITD per chirp.
+    """Detect the coded triple chirp, then estimate an independent ITD per chirp.
 
-    Detection uses all three known chirp positions simultaneously in both ears.
-    Each expected event is allowed a tiny local timing displacement (the physical
-    interaural delay), but the 200 ms packet spacing is fixed.  This is much less
-    likely to select an accidental single-chirp correlation peak.
+    This is the same detection/ITD method validated offline on the saved stereo
+    recordings: broadband normalized matched filtering on the channel mean,
+    explicit 200-ms three-event pattern matching, then short-window GCC-PHAT.
     """
-    left_full = recording[:, 0].astype(np.float64)
-    right_full = recording[:, 1].astype(np.float64)
-    left_full -= np.mean(left_full)
-    right_full -= np.mean(right_full)
-    reference = make_reference_chirp()
+    x = np.asarray(recording[:, :2], dtype=np.float64)
+    reference, reference_start_s = make_reference_chirp()
+    filtered = bandpass(x)
+    score = normalized_matched_filter(filtered.mean(axis=1), reference)
 
     if search_start_sample is None:
         search_start_sample = 0
     if search_end_sample is None:
-        search_end_sample = len(left_full)
-    search_start_sample = max(0, int(search_start_sample))
-    search_end_sample = min(len(left_full), int(search_end_sample))
-
-    spacing = int(round(BURST_SPACING_S * SAMPLE_RATE))
-    burst_span = (BURST_CHIRP_COUNT - 1) * spacing + len(reference)
-    if search_end_sample - search_start_sample < burst_span:
-        raise RuntimeError("Burst detection search window is too short.")
-
-    _, _, left_scores = matched_filter(left_full, reference)
-    _, _, right_scores = matched_filter(right_full, reference)
-    left_abs, right_abs = np.abs(left_scores), np.abs(right_scores)
-
-    # The two ears can differ by up to ~24 samples.  When scoring the packet,
-    # allow each ear to take its local maximum within that physically possible
-    # displacement rather than sampling both ears at exactly the same index.
-    max_lag = int(np.ceil(ear_distance / SPEED_OF_SOUND * SAMPLE_RATE))
-    local_radius = max_lag + 2
-
-    first_lo = search_start_sample
-    first_hi = min(search_end_sample - burst_span + 1,
-                   len(left_scores) - (BURST_CHIRP_COUNT - 1) * spacing,
-                   len(right_scores) - (BURST_CHIRP_COUNT - 1) * spacing)
-    if first_hi <= first_lo:
-        raise RuntimeError("No complete three-chirp burst fits inside the search window.")
-
-    candidates = np.arange(first_lo, first_hi, dtype=int)
-    packet_curve = np.empty(len(candidates), dtype=np.float64)
-    for ci, candidate in enumerate(candidates):
-        evidence = []
-        for k in range(BURST_CHIRP_COUNT):
-            expected = candidate + k * spacing
-            lo = max(0, expected - local_radius)
-            hi = min(len(left_abs), expected + local_radius + 1)
-            evidence.append(float(np.max(left_abs[lo:hi])))
-            evidence.append(float(np.max(right_abs[lo:hi])))
-        # RMS rewards a packet that is present repeatedly while still requiring
-        # evidence from the complete six-event (3 chirps x 2 ears) pattern.
-        packet_curve[ci] = float(np.sqrt(np.mean(np.square(evidence))))
-
-    best_local = int(np.argmax(packet_curve))
-    chirp_start = int(candidates[best_local])
-    detection_score = float(packet_curve[best_local])
-
-    # Compare the winning packet against the strongest independent alternative.
-    # This tells us whether the best match is distinctive, not merely non-zero.
-    exclusion = int(round(PROMINENCE_EXCLUSION_S * SAMPLE_RATE))
-    independent = np.abs(candidates - chirp_start) > exclusion
-    second_score = float(np.max(packet_curve[independent])) if np.any(independent) else 0.0
+        search_end_sample = len(score)
+    detection_score, second_score, chirp_starts, chirp_scores = detect_packet(
+        score, search_start_sample, search_end_sample)
     detection_prominence = detection_score / max(second_score, 1e-12)
 
-    chirp_starts = [chirp_start + k * spacing for k in range(BURST_CHIRP_COUNT)]
-    pad = int(round(WINDOW_PAD_S * SAMPLE_RATE))
-    itds, corrs, ilds, lag_samples_all = [], [], [], []
-    representative_lags = representative_corr = None
-
-    for start in chirp_starts:
-        window_start = max(0, start - pad)
-        window_end = min(len(left_full), start + len(reference) + pad)
-        left = left_full[window_start:window_end]
-        right = right_full[window_start:window_end]
-
-        left_itd = fft_bandpass(left, ITD_LOW_HZ, ITD_HIGH_HZ)
-        right_itd = fft_bandpass(right, ITD_LOW_HZ, ITD_HIGH_HZ)
-        lags, corr = correlations_for_lags(left_itd, right_itd, max_lag)
-        peak = int(np.argmax(corr))
-        refined = refine_peak(corr, peak)
-        lag_samples = lags[0] + refined
-        itd = lag_samples / SAMPLE_RATE
-
-        left_ild = fft_bandpass(left, ILD_LOW_HZ, ILD_HIGH_HZ)
-        right_ild = fft_bandpass(right, ILD_LOW_HZ, ILD_HIGH_HZ)
-        ild = 20.0 * np.log10((rms(left_ild) + 1e-12) / (rms(right_ild) + 1e-12))
-        itds.append(itd)
-        corrs.append(float(corr[peak]))
-        ilds.append(float(ild))
-        lag_samples_all.append(float(lag_samples))
-        if representative_corr is None or corr[peak] > np.max(representative_corr):
-            representative_lags, representative_corr = lags, corr
-
+    values = [itd_at(x, start, ear_distance) for start in chirp_starts]
+    itds = [v[0] for v in values]
+    corrs = [v[1] for v in values]
     itd = float(np.median(itds))
     lag_samples = itd * SAMPLE_RATE
-    itd_spread_us = float((max(itds) - min(itds)) * 1e6)
-    bearing = float(np.degrees(np.arcsin(np.clip(SPEED_OF_SOUND * itd / ear_distance, -1.0, 1.0))))
+    itd_spread_us = float(np.ptp(itds) * 1e6)
+    bearing = float(np.degrees(np.arcsin(np.clip(
+        SPEED_OF_SOUND * itd / ear_distance, -1.0, 1.0))))
 
-    detection_curve = np.full(len(left_scores), np.nan, dtype=np.float64)
-    detection_curve[candidates] = packet_curve
+    # Preserve ILD as a diagnostic, using the whole detected packet region.
+    pad = int(round(WINDOW_PAD_S * SAMPLE_RATE))
     window_start = max(0, chirp_starts[0] - pad)
-    window_end = min(len(left_full), chirp_starts[-1] + len(reference) + pad)
+    window_end = min(len(x), chirp_starts[-1] + len(reference) + pad)
+    left_ild = bandpass(x[window_start:window_end, 0], ILD_LOW_HZ, ILD_HIGH_HZ)
+    right_ild = bandpass(x[window_start:window_end, 1], ILD_LOW_HZ, ILD_HIGH_HZ)
+    ild = 20.0 * np.log10((rms(left_ild)+1e-12)/(rms(right_ild)+1e-12))
+
+    # A compact lag curve for the existing diagnostic plot.
+    representative = int(np.argmax(corrs))
+    start = chirp_starts[representative]
+    a = max(0, start - int(round(ITD_WINDOW_BEFORE_S*SAMPLE_RATE)))
+    b = min(len(x), a + int(round(ITD_WINDOW_DURATION_S*SAMPLE_RATE)))
+    z = bandpass(x[a:b, :2])
+    l = z[:,0]-z[:,0].mean(); r = z[:,1]-z[:,1].mean()
+    max_lag = int(np.ceil(ear_distance/SPEED_OF_SOUND*ITD_LIMIT_MARGIN*SAMPLE_RATE))
+    lags = np.arange(-max_lag, max_lag+1)
+    corr_curve = []
+    for lag in lags:
+        if lag > 0: aa, bb = l[:-lag], r[lag:]
+        elif lag < 0: aa, bb = l[-lag:], r[:lag]
+        else: aa, bb = l, r
+        corr_curve.append(np.dot(aa,bb)/(np.linalg.norm(aa)*np.linalg.norm(bb)+1e-15))
+
+    detection_curve = np.full(len(score), np.nan)
+    detection_curve[max(0,search_start_sample):min(len(score),search_end_sample)] = \
+        np.abs(score[max(0,search_start_sample):min(len(score),search_end_sample)])
 
     return {
-        "left_full": left_full, "right_full": right_full,
-        "left": left_full[window_start:window_end], "right": right_full[window_start:window_end],
-        "detection_curve": detection_curve, "chirp_start": chirp_start,
-        "chirp_starts": chirp_starts, "window_start": window_start, "window_end": window_end,
+        "left_full": x[:,0], "right_full": x[:,1],
+        "left": x[window_start:window_end,0], "right": x[window_start:window_end,1],
+        "detection_curve": detection_curve, "chirp_start": chirp_starts[0],
+        "chirp_starts": chirp_starts, "chirp_scores": chirp_scores,
+        "reference_start_s": reference_start_s,
+        "window_start": window_start, "window_end": window_end,
         "detection_score": detection_score, "second_detection_score": second_score,
         "detection_prominence": detection_prominence,
         "search_start_sample": search_start_sample, "search_end_sample": search_end_sample,
-        "lags": representative_lags, "corr": representative_corr,
+        "lags": lags, "corr": np.asarray(corr_curve),
         "lag_samples": lag_samples, "itd": itd, "bearing": bearing,
-        "ild": float(np.median(ilds)), "itd_correlation": float(np.median(corrs)),
-        "individual_itd_us": [v * 1e6 for v in itds], "individual_correlations": corrs,
-        "individual_lag_samples": lag_samples_all, "itd_spread_us": itd_spread_us,
+        "ild": float(ild), "itd_correlation": float(np.median(corrs)),
+        "individual_itd_us": [v*1e6 for v in itds], "individual_correlations": corrs,
+        "individual_lag_samples": [v*SAMPLE_RATE for v in itds],
+        "itd_spread_us": itd_spread_us,
     }
-
 
 def save_plot(result, path):
     left_full = result["left_full"]
@@ -562,7 +543,7 @@ def main():
     print(f"Detection score:       {result['detection_score']:.3f}")
     print(f"Second-best packet:    {result['second_detection_score']:.3f}")
     print(f"Packet prominence:     {result['detection_prominence']:.2f}x")
-    print(f"Output latency est.:   {(toa_s-NOMINAL_FIRST_CHIRP_S)*1000:+.1f} ms")
+    print(f"Output latency est.:   {(toa_s-result['reference_start_s'])*1000:+.1f} ms")
     print(f"ITD:                   {result['itd']*1e6:+.1f} us")
     print(f"Sample lag:            {result['lag_samples']:+.2f} samples")
     print(f"ILD (L/R):             {result['ild']:+.2f} dB")
