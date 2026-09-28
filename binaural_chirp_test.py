@@ -377,13 +377,10 @@ def main():
     port = int(os.environ.get("LBB_BINAURAL_PORT", "8000"))
     pi_name = os.environ.get("LBB_BINAURAL_PI_NAME", "unknown")
     run_id = os.environ.get("LBB_BINAURAL_RUN_ID", "")
-    emit_text = os.environ.get("LBB_BINAURAL_EMIT_AT")
-
-    if not server or not run_id or not emit_text:
+    if not server or not run_id:
         raise SystemExit(
             "Launch this test through the synchronized server/client binaural path."
         )
-    emit_at = float(emit_text)
 
     save_path = os.path.join(
         f"{Config.repo_path}/boxes/audio/signal-processing/python/measurement",
@@ -408,7 +405,7 @@ def main():
     mic.start()
     record_start_epoch = time.time()
 
-    # Do not let the server emit until capture is genuinely running.
+    # Tell the server capture is genuinely live BEFORE an emission epoch exists.
     post_binaural_result(server, port, {
         "id": pi_name,
         "run": run_id,
@@ -416,6 +413,25 @@ def main():
     }, endpoint="/binaural_ready")
 
     print(f"Recording start:       {record_start_epoch:.9f}")
+    print("Waiting for server to arm localisation emission...")
+
+    # Once every listener is READY, the server chooses a fresh future T. Polling
+    # happens inside this already-recording process, so the client's 2 s command
+    # polling interval can no longer make microphone capture miss the chirp.
+    emit_at = None
+    trigger_deadline = time.monotonic() + 15.0
+    while time.monotonic() < trigger_deadline:
+        reply = post_binaural_result(server, port, {
+            "id": pi_name, "run": run_id,
+        }, endpoint="/binaural_trigger")
+        if reply.get("armed"):
+            emit_at = float(reply["emit_at"])
+            break
+        time.sleep(0.05)
+    if emit_at is None:
+        mic.stop()
+        raise SystemExit("Localisation emission was not armed within 15 seconds.")
+
     print(f"Scheduled chirp:       {emit_at:.9f}")
     print(f"Pre-roll:              {(emit_at-record_start_epoch)*1000:.1f} ms")
     print(f"Detection search:      T+{DETECTION_SEARCH_START_S*1000:.0f} to T+{DETECTION_SEARCH_END_S*1000:.0f} ms")
@@ -441,6 +457,15 @@ def main():
     scheduled_sample = int(round((emit_at - record_start_epoch) * SAMPLE_RATE))
     search_start_sample = scheduled_sample + int(round(DETECTION_SEARCH_START_S * SAMPLE_RATE))
     search_end_sample = scheduled_sample + int(round(DETECTION_SEARCH_END_S * SAMPLE_RATE))
+
+    burst_span_samples = int(round((BURST_CHIRP_COUNT - 1) * BURST_SPACING_S * SAMPLE_RATE)) + int(round(CHIRP_DURATION_S * SAMPLE_RATE))
+    available_start = max(0, search_start_sample)
+    available_end = min(len(recording), search_end_sample)
+    if available_end - available_start < burst_span_samples:
+        raise SystemExit(
+            "Localisation recording does not contain a complete post-T triple-chirp "
+            f"search window (pre-roll={(emit_at-record_start_epoch)*1000:.1f} ms)."
+        )
 
     result = analyse(
         recording,

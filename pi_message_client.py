@@ -386,31 +386,28 @@ def run_audio_checkpoint(command, target, stop_event):
 
 # ----------------- Binaural localisation execution -----------------
 def handle_binaural_command(server_ip, port, pi_name, command, stop_event):
-    """
-    Launch the microphone worker during the preparation phase.
+    """Launch microphone capture immediately; the listener obtains T afterwards.
 
-    The worker starts capture immediately, POSTs /binaural_ready itself, remains
-    alive across the server's scheduled emission epoch, then posts its result.
+    ``__binaural__`` intentionally contains no emission epoch.  The worker starts
+    the microphone, reports READY, and then obtains the server-selected T through
+    /binaural_trigger.  This makes a late command poll harmless: emission cannot be
+    scheduled until this process is already recording.
     """
-    parts = command.split(":", 4)
-    if len(parts) != 5 or parts[0] != "__binaural__":
+    parts = command.split(":", 2)
+    if len(parts) != 3 or parts[0] != "__binaural__":
         return
-
-    run_id, prepare_text, emit_text, script_command = parts[1:]
-    prepare_at, emit_at = float(prepare_text), float(emit_text)
+    run_id, script_command = parts[1:]
 
     chrony = read_chrony_status()
     if not chrony["synchronized"]:
-        report_sync_result(
-            server_ip, port, pi_name, run_id, emit_at, None,
-            "unsynchronized", "chrony is not synchronized", chrony
-        )
+        try:
+            http_post(server_ip, port, "/post_result", {
+                "id": pi_name,
+                "message": f"Binaural test {run_id} not started: chrony is not synchronized",
+            })
+        except OSError:
+            pass
         return
-
-    while time.time() < prepare_at:
-        if stop_event.is_set():
-            return
-        time.sleep(min(0.01, max(0.0, prepare_at - time.time())))
 
     words = [os.path.expandvars(os.path.expanduser(w)) for w in shlex.split(script_command)]
     if not words or "binaural_chirp_test.py" not in " ".join(words):
@@ -422,7 +419,6 @@ def handle_binaural_command(server_ip, port, pi_name, command, stop_event):
         "LBB_BINAURAL_PORT": str(port),
         "LBB_BINAURAL_PI_NAME": str(pi_name),
         "LBB_BINAURAL_RUN_ID": str(run_id),
-        "LBB_BINAURAL_EMIT_AT": f"{emit_at:.9f}",
     })
 
     try:
@@ -439,14 +435,12 @@ def handle_binaural_command(server_ip, port, pi_name, command, stop_event):
         output = ((stdout or "") + (stderr or "")).strip()
         if output:
             http_post(server_ip, port, "/post_result", {
-                "id": pi_name,
-                "message": output,
+                "id": pi_name, "message": output,
             })
     except (OSError, subprocess.SubprocessError) as error:
         try:
             http_post(server_ip, port, "/post_result", {
-                "id": pi_name,
-                "message": f"Binaural test failed: {error}",
+                "id": pi_name, "message": f"Binaural test failed: {error}",
             })
         except OSError:
             pass
