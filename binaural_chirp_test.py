@@ -8,6 +8,7 @@ import time
 from contextlib import contextmanager
 import urllib.parse
 import urllib.request
+import wave
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -400,8 +401,9 @@ def main():
             raise SystemExit('Input device "MAX" not found')
 
         buffer_size = SAMPLE_RATE // 10
-        # Preparation can be several seconds before T, so retain a generous buffer.
-        max_samples = int(SAMPLE_RATE * 12.0)
+        # Readiness gating can leave an early listener recording for many seconds; retain
+        # enough audio that the beginning is not discarded before the burst arrives.
+        max_samples = int(SAMPLE_RATE * 30.0)
         mic = Microphone.Microphone(
             input_device, 2, "int32", SAMPLE_RATE, buffer_size, max_samples
         )
@@ -453,6 +455,28 @@ def main():
 
     if recording.ndim != 2 or recording.shape[1] < 2:
         raise SystemExit(f"Expected stereo audio; got {recording.shape}")
+
+    # Save the unprocessed stereo microphone capture in the invoking user's home
+    # directory.  Keep the microphone's native signed 32-bit PCM samples: do not
+    # normalize them, because absolute level/SNR is useful when diagnosing chirp
+    # detection.  The filename includes both run and listener so files from
+    # different Pis can be copied into the same laptop directory without clashes.
+    safe_run_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in run_id)
+    safe_pi_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in pi_name)
+    raw_wav_path = os.path.expanduser(
+        f"~/binaural_raw_{safe_run_id}_{safe_pi_name}.wav"
+    )
+    raw_pcm = np.asarray(recording[:, :2])
+    if raw_pcm.dtype != np.int32:
+        raw_pcm = np.clip(
+            raw_pcm, np.iinfo(np.int32).min, np.iinfo(np.int32).max
+        ).astype(np.int32)
+    with wave.open(raw_wav_path, "wb") as wav_out:
+        wav_out.setnchannels(2)
+        wav_out.setsampwidth(4)
+        wav_out.setframerate(SAMPLE_RATE)
+        wav_out.writeframes(raw_pcm.astype("<i4", copy=False).tobytes())
+    print(f"Raw stereo WAV saved:  {raw_wav_path}")
 
     # mic.sound contains the samples accumulated since mic.start() (up to the
     # configured max buffer). Convert the matched-filter sample offset into the
