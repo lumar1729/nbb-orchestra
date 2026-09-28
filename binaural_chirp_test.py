@@ -38,6 +38,12 @@ WINDOW_PAD_S = 0.025
 MIN_DETECTION_SCORE = 0.10
 MIN_ITD_CORRELATION = 0.20
 
+# Restrict chirp detection to a physically plausible interval after the
+# scheduled playback time. This prevents unrelated room sounds elsewhere in
+# the recording from winning the global matched-filter search.
+DETECTION_SEARCH_START_S = 0.0
+DETECTION_SEARCH_END_S = 1.0
+
 
 @contextmanager
 def suppress_native_stderr():
@@ -164,7 +170,7 @@ def rms(x):
     return float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
 
 
-def analyse(recording, ear_distance):
+def analyse(recording, ear_distance, search_start_sample=None, search_end_sample=None):
     left_full = recording[:, 0].astype(np.float64)
     right_full = recording[:, 1].astype(np.float64)
     left_full -= np.mean(left_full)
@@ -175,7 +181,40 @@ def analyse(recording, ear_distance):
     # Detect against the average of both ears. This avoids choosing one ear as
     # privileged while giving a stronger signal than either channel alone.
     mono = 0.5 * (left_full + right_full)
-    chirp_start, detection_score, detection_curve = matched_filter(mono, reference)
+
+    # The server tells us when playback was scheduled, so do not search the
+    # entire multi-second recording. In a noisy room, an unrelated sound can
+    # otherwise produce the largest matched-filter response. Search only the
+    # physically plausible interval supplied by main().
+    if search_start_sample is None:
+        search_start_sample = 0
+    if search_end_sample is None:
+        search_end_sample = len(mono)
+
+    search_start_sample = max(0, int(search_start_sample))
+    search_end_sample = min(len(mono), int(search_end_sample))
+
+    if search_end_sample - search_start_sample < len(reference):
+        raise RuntimeError(
+            "Chirp detection search window is too short for the reference chirp: "
+            f"samples {search_start_sample}:{search_end_sample}."
+        )
+
+    search_mono = mono[search_start_sample:search_end_sample]
+    local_chirp_start, detection_score, local_detection_curve = matched_filter(
+        search_mono, reference
+    )
+    chirp_start = search_start_sample + local_chirp_start
+
+    # Keep a full-recording-length detection curve for the existing diagnostic
+    # plot. Locations outside the allowed search interval are NaN, making the
+    # constrained search visually explicit.
+    full_curve_len = max(0, len(mono) - len(reference) + 1)
+    detection_curve = np.full(full_curve_len, np.nan, dtype=np.float64)
+    curve_start = search_start_sample
+    curve_end = min(full_curve_len, curve_start + len(local_detection_curve))
+    if curve_end > curve_start:
+        detection_curve[curve_start:curve_end] = local_detection_curve[:curve_end-curve_start]
 
     pad = int(round(WINDOW_PAD_S * SAMPLE_RATE))
     chirp_n = len(reference)
@@ -218,6 +257,8 @@ def analyse(recording, ear_distance):
         "window_start": window_start,
         "window_end": window_end,
         "detection_score": abs(detection_score),
+        "search_start_sample": search_start_sample,
+        "search_end_sample": search_end_sample,
         "lags": lags,
         "corr": corr,
         "lag_samples": lag_samples,
@@ -351,6 +392,7 @@ def main():
     print(f"Recording start:       {record_start_epoch:.9f}")
     print(f"Scheduled chirp:       {emit_at:.9f}")
     print(f"Pre-roll:              {(emit_at-record_start_epoch)*1000:.1f} ms")
+    print(f"Detection search:      T+{DETECTION_SEARCH_START_S*1000:.0f} to T+{DETECTION_SEARCH_END_S*1000:.0f} ms")
 
     try:
         stop_at = emit_at + args.post_roll
@@ -366,7 +408,20 @@ def main():
     # mic.sound contains the samples accumulated since mic.start() (up to the
     # configured max buffer). Convert the matched-filter sample offset into the
     # same Chrony-disciplined epoch used by the server.
-    result = analyse(recording, args.ear_distance)
+    # Convert the scheduled playback epoch into recording-relative samples and
+    # search only from T to T+1 s. The padded playback WAV currently contains
+    # the chirp about 200 ms after T, while this generous 1 s window leaves room
+    # for output-device buffering without admitting sounds from seconds away.
+    scheduled_sample = int(round((emit_at - record_start_epoch) * SAMPLE_RATE))
+    search_start_sample = scheduled_sample + int(round(DETECTION_SEARCH_START_S * SAMPLE_RATE))
+    search_end_sample = scheduled_sample + int(round(DETECTION_SEARCH_END_S * SAMPLE_RATE))
+
+    result = analyse(
+        recording,
+        args.ear_distance,
+        search_start_sample=search_start_sample,
+        search_end_sample=search_end_sample,
+    )
     arrival_epoch = record_start_epoch + result["chirp_start"] / SAMPLE_RATE
     toa_s = arrival_epoch - emit_at
     apparent_distance_m = SPEED_OF_SOUND * toa_s
