@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import argparse
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -97,8 +98,14 @@ if not wav_files:
 
 if args.file:
     requested = os.path.expanduser(os.path.expandvars(args.file))
-    if os.path.isabs(requested) or os.path.dirname(requested):
+    if os.path.isabs(requested):
         WAV_FILE = requested
+        wav_filename = os.path.basename(requested)
+    elif os.path.dirname(requested):
+        # Never resolve an explicit relative path against the process CWD.
+        # Orchestra clients may be launched from $HOME, the repo root, etc.
+        # Interpret relative paths from the LastBlackBox repository root.
+        WAV_FILE = str((Path(Config.repo_path) / requested).resolve())
         wav_filename = os.path.basename(requested)
     else:
         # Explicit utility files such as localisation_chirp.wav live directly
