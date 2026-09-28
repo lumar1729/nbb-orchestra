@@ -391,8 +391,8 @@ def main():
     p = argparse.ArgumentParser(
         description="Record a server-scheduled localisation chirp and estimate ToA/ITD/ILD."
     )
-    p.add_argument("--post-roll", type=float, default=1.5,
-                   help="Seconds to continue recording after scheduled emission.")
+    p.add_argument("--post-roll", type=float, default=3.0,
+                   help="Seconds to continue recording after scheduled emission (minimum 3.0 s).")
     p.add_argument("--ear-distance", type=float, default=EAR_DISTANCE_M)
     args = p.parse_args()
 
@@ -460,8 +460,12 @@ def main():
     print(f"Pre-roll:              {(emit_at-record_start_epoch)*1000:.1f} ms")
     print(f"Detection search:      T+{DETECTION_SEARCH_START_S*1000:.0f} to T+{DETECTION_SEARCH_END_S*1000:.0f} ms")
 
+    # Keep the microphone running well beyond the complete 0.880 s localisation
+    # packet.  A minimum of 3 s after T deliberately gives the audio backend,
+    # acoustic propagation and any scheduling jitter ample margin.
+    post_roll_s = max(3.0, float(args.post_roll))
+    stop_at = emit_at + post_roll_s
     try:
-        stop_at = emit_at + args.post_roll
         while time.time() < stop_at:
             time.sleep(0.005)
 
@@ -476,6 +480,22 @@ def main():
 
     if recording.ndim != 2 or recording.shape[1] < 2:
         raise SystemExit(f"Expected stereo audio; got {recording.shape}")
+
+    record_stop_epoch = record_start_epoch + len(recording) / SAMPLE_RATE
+    post_t_recorded_s = record_stop_epoch - emit_at
+    packet_end_after_t_s = LEADING_SILENCE_S + (BURST_CHIRP_COUNT - 1) * BURST_SPACING_S + CHIRP_DURATION_S
+    complete_packet = post_t_recorded_s >= packet_end_after_t_s
+
+    print(f"Recording stop:        {record_stop_epoch:.9f}")
+    print(f"Post-T recorded:       {post_t_recorded_s:.3f} s")
+    print(f"Packet requires:       {packet_end_after_t_s:.3f} s after T")
+    print(f"Complete packet capture: {'YES' if complete_packet else 'NO'}")
+    if not complete_packet:
+        raise SystemExit(
+            "Localisation recording ended before the complete three-chirp packet "
+            f"could be captured ({post_t_recorded_s:.3f} s available; "
+            f"{packet_end_after_t_s:.3f} s required)."
+        )
 
     # Sanity-check the exact snapshot that will be analysed and saved.
     print("Raw capture:")
