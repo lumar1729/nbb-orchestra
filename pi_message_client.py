@@ -41,6 +41,7 @@ import socketserver
 
 import os
 import shutil
+import wave
 
 # Make emoji/text output safe on every platform (Windows consoles default
 # to encodings like cp1252 which cannot represent emoji characters)
@@ -340,46 +341,96 @@ def is_audio_checkpoint_command(command):
 
 
 def run_audio_checkpoint(command, target, stop_event):
-    """Start play_wav early, wait for device readiness, trigger at target."""
+    """Preload play_wav immediately, wait for READY, then send GO at target."""
     words = [os.path.expandvars(os.path.expanduser(w)) for w in shlex.split(command)]
     if not is_audio_checkpoint_command(" ".join(words)) or not is_allowed_program(words[0]):
         return None
+
+    diagnostics = []
+    launch_at = time.time()
+    diagnostics.append(f"Emitter play_wav launch: {launch_at:.9f} ({(launch_at-target)*1000:+.1f} ms vs T)")
+
+    # Report the exact file that the child has been asked to play.  This is done
+    # here, before launching play_wav, so a path/packet mismatch is visible even
+    # if audio-device initialisation subsequently fails.
+    try:
+        if "--file" in words:
+            raw_path = words[words.index("--file") + 1]
+            wav_path = raw_path if os.path.isabs(raw_path) else os.path.join(COMMAND_CWD or os.getcwd(), raw_path)
+            wav_path = os.path.abspath(wav_path)
+            diagnostics.append(f"Emitter WAV path: {wav_path}")
+            diagnostics.append(f"Emitter WAV exists: {os.path.isfile(wav_path)}")
+            if os.path.isfile(wav_path):
+                try:
+                    with wave.open(wav_path, "rb") as wf:
+                        frames, rate, channels = wf.getnframes(), wf.getframerate(), wf.getnchannels()
+                    diagnostics.append(
+                        f"Emitter WAV metadata: {frames} frames, {rate} Hz, {channels} ch, "
+                        f"{frames / rate:.3f} s")
+                except (wave.Error, OSError) as error:
+                    diagnostics.append(f"Emitter WAV metadata unavailable: {error}")
+    except (ValueError, IndexError) as error:
+        diagnostics.append(f"Emitter WAV inspection failed: {error}")
+
     ready_r, ready_w = os.pipe()
     go_r, go_w = os.pipe()
     env = dict(os.environ)
     env.update({"LBB_AUDIO_READY_FD": str(ready_w), "LBB_AUDIO_GO_FD": str(go_r)})
+    proc = None
     try:
         proc = subprocess.Popen(words, cwd=COMMAND_CWD, env=env,
                                 pass_fds=(ready_w, go_r), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=(os.name == "posix"))
         register_process(proc)
+        diagnostics.append(f"Emitter play_wav PID: {proc.pid}")
         os.close(ready_w)
         os.close(go_r)
-        os.read(ready_r, 6)
+        ready_bytes = os.read(ready_r, 64)
+        ready_at = time.time()
         os.close(ready_r)
+        diagnostics.append(
+            f"Emitter play_wav READY: {ready_at:.9f} "
+            f"({(ready_at-target)*1000:+.1f} ms vs T; {(ready_at-launch_at)*1000:.1f} ms after launch; "
+            f"signal={ready_bytes!r})")
+
+        if ready_at > target:
+            diagnostics.append(f"WARNING: play_wav became READY {(ready_at-target)*1000:.1f} ms after T")
+
         while time.time() < target:
             if stop_event.is_set():
                 proc.terminate()
-                return "(audio checkpoint cancelled)"
+                return {"output": "\n".join(diagnostics + ["audio checkpoint cancelled"]),
+                        "checkpoint_at": None, "trigger_error_ms": None,
+                        "checkpoint_error_ms": None, "status": "cancelled"}
         trigger_at = time.time()
         os.write(go_w, b"G")
         os.close(go_w)
+        diagnostics.append(f"Emitter GO sent: {trigger_at:.9f} ({(trigger_at-target)*1000:+.3f} ms vs T)")
         try:
             stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
         finally:
             unregister_process(proc)
-        text = (stdout or "") + (stderr or "")
-        checkpoint = next((float(line.split(":", 1)[1]) for line in text.splitlines()
+        exit_at = time.time()
+        diagnostics.append(f"Emitter play_wav exit: {exit_at:.9f}; return code={proc.returncode}")
+        child_text = (stdout or "") + (stderr or "")
+        checkpoint = next((float(line.split(":", 1)[1]) for line in child_text.splitlines()
                            if line.startswith("AUDIO_CHECKPOINT:")), None)
-        return {"output": text.strip() or "(audio produced no output)",
+        if checkpoint is not None:
+            diagnostics.append(f"Emitter AUDIO_CHECKPOINT: {checkpoint:.9f} ({(checkpoint-target)*1000:+.3f} ms vs T)")
+        if child_text.strip():
+            diagnostics.append("play_wav output:\n" + child_text.strip())
+        return {"output": "\n".join(diagnostics),
                 "checkpoint_at": checkpoint,
                 "trigger_error_ms": (trigger_at - target) * 1000,
                 "checkpoint_error_ms": ((checkpoint - target) * 1000
                                          if checkpoint is not None else None),
                 "status": "ok" if proc.returncode == 0 else "error"}
     except (OSError, subprocess.SubprocessError) as error:
-        return {"output": str(error), "checkpoint_at": None,
+        if proc is not None:
+            unregister_process(proc)
+        diagnostics.append(f"Emitter playback exception: {error}")
+        return {"output": "\n".join(diagnostics), "checkpoint_at": None,
                 "trigger_error_ms": (time.time() - target) * 1000,
                 "checkpoint_error_ms": None, "status": "error"}
 
@@ -447,26 +498,28 @@ def handle_binaural_command(server_ip, port, pi_name, command, stop_event):
 
 
 def handle_spatial_emit(server_ip, port, pi_name, command, stop_event):
-    """Emit one localisation chirp only after every listener reports READY."""
+    """Preload the emitter as soon as the already-ready listeners permit it."""
     parts = command.split(":", 4)
     if len(parts) != 5:
         return
     _, run_id, prepare_text, emit_text, script_command = parts
     prepare_at, emit_at = float(prepare_text), float(emit_text)
+    received_at = time.time()
     chrony = read_chrony_status()
     if not chrony["synchronized"]:
         report_sync_result(server_ip, port, pi_name, run_id, emit_at, None,
                            "unsynchronized", "chrony is not synchronized", chrony)
         return
+
     while time.time() < prepare_at:
-        if stop_event.is_set(): return
-        time.sleep(min(0.01, max(0.0, prepare_at-time.time())))
-    # Give listener processes time to open the microphones, then ask the server
-    # whether every expected receiver has actually posted /binaural_ready.
-    permission_at = emit_at - 0.20
-    while time.time() < permission_at:
-        if stop_event.is_set(): return
-        time.sleep(min(0.01, max(0.0, permission_at-time.time())))
+        if stop_event.is_set():
+            return
+        time.sleep(min(0.01, max(0.0, prepare_at - time.time())))
+
+    # The server only queues this emitter command after every listener has
+    # reported /binaural_ready.  Ask permission immediately, rather than waiting
+    # until T-200 ms, so play_wav gets the full emission lead to initialise.
+    permission_request_at = time.time()
     try:
         reply = json.loads(http_post(server_ip, port, "/spatial_emit_permission", {
             "id": pi_name, "run": run_id
@@ -475,12 +528,20 @@ def handle_spatial_emit(server_ip, port, pi_name, command, stop_event):
         report_sync_result(server_ip, port, pi_name, run_id, emit_at, None,
                            "cancelled", f"emission permission failed: {error}", chrony)
         return
+    permission_at = time.time()
     if not reply.get("ok"):
         report_sync_result(server_ip, port, pi_name, run_id, emit_at, None,
                            "cancelled", reply.get("error", "listeners not ready"), chrony)
         return
+
     result = run_audio_checkpoint(script_command, emit_at, stop_event)
     if result is not None:
+        prefix = (
+            f"Emitter command received: {received_at:.9f} ({(received_at-emit_at)*1000:+.1f} ms vs T)\n"
+            f"Emitter permission requested: {permission_request_at:.9f}\n"
+            f"Emitter permission granted: {permission_at:.9f} ({(permission_at-emit_at)*1000:+.1f} ms vs T)"
+        )
+        result["output"] = prefix + "\n" + result.get("output", "")
         report_sync_result(server_ip, port, pi_name, run_id, emit_at,
                            result.get("checkpoint_at"), result["status"],
                            result["output"], chrony, audio_result=result)
