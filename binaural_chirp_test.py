@@ -50,9 +50,10 @@ PROMINENCE_EXCLUSION_S = 0.050
 PACKET_TIMING_TOLERANCE_S = 0.030
 PACKET_TIMING_SCALE_S = 0.020
 ITD_WINDOW_BEFORE_S = 0.003
-ITD_WINDOW_DURATION_S = 0.055
+ITD_WINDOW_DURATION_S = 0.086  # 3 ms pre-roll + full 80 ms chirp + small tail
 GCC_INTERPOLATION = 16
-ITD_LIMIT_MARGIN = 1.10
+ITD_LIMIT_MARGIN = 1.00  # path-length difference cannot exceed acoustic-port spacing
+ITD_CONSENSUS_RADIUS_US = 90.0
 
 # One localisation playback contains three identical chirps. Their known spacing
 # acts as an acoustic code: unrelated room sounds must match all three events at
@@ -177,38 +178,44 @@ def detect_packet(score, search_start_sample, search_end_sample):
     return best[1], second_score, best[2], best[3]
 
 
-def gcc_phat(left, right, max_itd_s, interp=GCC_INTERPOLATION):
-    """Sub-sample GCC-PHAT; positive means the right channel is delayed."""
+def gcc_phat_curve(left, right, max_itd_s, interp=GCC_INTERPOLATION):
+    """Return the GCC-PHAT magnitude over the physically possible ITD range.
+
+    Positive lag means the right channel is delayed.  The returned curve is
+    normalized to unit peak so curves from all three chirps can be combined.
+    """
     nfft = 1 << int(np.ceil(np.log2(len(left) + len(right))))
     left_fft = np.fft.rfft(left, nfft)
     right_fft = np.fft.rfft(right, nfft)
     cross = left_fft * np.conj(right_fft)
     cross /= np.maximum(np.abs(cross), 1e-15)
     cc = np.fft.irfft(cross, nfft * interp)
-    max_shift = int(round(max_itd_s * SAMPLE_RATE * interp))
+    max_shift = int(np.floor(max_itd_s * SAMPLE_RATE * interp))
     local = np.r_[cc[-max_shift:], cc[:max_shift+1]]
-    j = int(np.argmax(np.abs(local)))
-    shift = j - max_shift
-    y = np.abs(local)
+    # gcc_phat used the opposite FFT-shift sign; preserve the public convention
+    # that positive ITD means the right channel is delayed.
+    lags_s = -np.arange(-max_shift, max_shift + 1, dtype=float) / (interp * SAMPLE_RATE)
+    order = np.argsort(lags_s)
+    lags_s = lags_s[order]
+    mag = np.abs(local)[order]
+    mag /= np.max(mag) + 1e-15
+    return lags_s, mag
+
+
+def _parabolic_peak(lags_s, curve, j):
+    """Refine one sampled correlation peak with a three-point parabola."""
     frac = 0.0
-    if 0 < j < len(y)-1:
-        denom = y[j-1] - 2.0*y[j] + y[j+1]
+    if 0 < j < len(curve) - 1:
+        denom = curve[j-1] - 2.0*curve[j] + curve[j+1]
         if abs(denom) > 1e-15:
-            frac = 0.5 * (y[j-1] - y[j+1]) / denom
-    return -(shift + frac) / (interp * SAMPLE_RATE)
+            frac = 0.5 * (curve[j-1] - curve[j+1]) / denom
+            frac = float(np.clip(frac, -1.0, 1.0))
+    step = lags_s[1] - lags_s[0] if len(lags_s) > 1 else 0.0
+    return float(lags_s[j] + frac * step)
 
 
-def itd_at(recording, start, ear_distance):
-    """Estimate one chirp's ITD from the same short window used offline."""
-    a = max(0, int(start) - int(round(ITD_WINDOW_BEFORE_S * SAMPLE_RATE)))
-    b = min(len(recording), a + int(round(ITD_WINDOW_DURATION_S * SAMPLE_RATE)))
-    z = bandpass(recording[a:b, :2])
-    left = z[:, 0] - z[:, 0].mean()
-    right = z[:, 1] - z[:, 1].mean()
-    window = np.hanning(len(left))
-    max_itd_s = ear_distance / SPEED_OF_SOUND * ITD_LIMIT_MARGIN
-    itd = gcc_phat(left * window, right * window, max_itd_s)
-
+def _aligned_corr(left, right, itd):
+    """Ordinary normalized correlation after aligning by the requested ITD."""
     lag = int(round(itd * SAMPLE_RATE))
     if lag >= 0:
         l = left[:-lag] if lag else left
@@ -216,8 +223,50 @@ def itd_at(recording, start, ear_distance):
     else:
         k = -lag
         l, r = left[k:], right[:-k]
-    corr = float(np.dot(l, r) / (np.linalg.norm(l)*np.linalg.norm(r) + 1e-15))
-    return itd, corr
+    return float(np.dot(l, r) / (np.linalg.norm(l)*np.linalg.norm(r) + 1e-15))
+
+
+def itd_curve_at(recording, start, ear_distance):
+    """Compute one chirp's GCC-PHAT curve over the physical ITD interval."""
+    a = max(0, int(start) - int(round(ITD_WINDOW_BEFORE_S * SAMPLE_RATE)))
+    b = min(len(recording), a + int(round(ITD_WINDOW_DURATION_S * SAMPLE_RATE)))
+    z = bandpass(recording[a:b, :2])
+    left = z[:, 0] - z[:, 0].mean()
+    right = z[:, 1] - z[:, 1].mean()
+    window = np.hanning(len(left))
+    max_itd_s = ear_distance / SPEED_OF_SOUND * ITD_LIMIT_MARGIN
+    lags_s, curve = gcc_phat_curve(left * window, right * window, max_itd_s)
+    return lags_s, curve, left, right
+
+
+def consensus_itd(recording, starts, ear_distance):
+    """Estimate one ITD jointly from all three repeated chirps.
+
+    Each chirp contributes its complete GCC-PHAT curve.  Their geometric mean
+    rewards a delay that is supported by every repetition and suppresses a
+    strong reflection/sidelobe that appears in only one chirp.  Individual
+    diagnostics are then measured at the strongest local peak near that joint
+    solution rather than allowing unrelated peaks to determine the median.
+    """
+    items = [itd_curve_at(recording, start, ear_distance) for start in starts]
+    lags_s = items[0][0]
+    curves = np.vstack([item[1] for item in items])
+    consensus_curve = np.exp(np.mean(np.log(np.maximum(curves, 1e-12)), axis=0))
+    j = int(np.argmax(consensus_curve))
+    itd = _parabolic_peak(lags_s, consensus_curve, j)
+
+    radius = ITD_CONSENSUS_RADIUS_US * 1e-6
+    individual = []
+    correlations = []
+    for curve, (_, _, left, right) in zip(curves, items):
+        mask = np.abs(lags_s - itd) <= radius
+        indices = np.flatnonzero(mask)
+        jj = int(indices[np.argmax(curve[indices])]) if len(indices) else j
+        local_itd = _parabolic_peak(lags_s, curve, jj)
+        individual.append(local_itd)
+        correlations.append(_aligned_corr(left, right, local_itd))
+
+    return itd, individual, correlations, lags_s, consensus_curve
 
 
 def rms(x):
@@ -244,10 +293,8 @@ def analyse(recording, ear_distance, search_start_sample=None, search_end_sample
         score, search_start_sample, search_end_sample)
     detection_prominence = detection_score / max(second_score, 1e-12)
 
-    values = [itd_at(x, start, ear_distance) for start in chirp_starts]
-    itds = [v[0] for v in values]
-    corrs = [v[1] for v in values]
-    itd = float(np.median(itds))
+    itd, itds, corrs, consensus_lags_s, consensus_curve = consensus_itd(
+        x, chirp_starts, ear_distance)
     lag_samples = itd * SAMPLE_RATE
     itd_spread_us = float(np.ptp(itds) * 1e6)
     bearing = float(np.degrees(np.arcsin(np.clip(
@@ -261,21 +308,9 @@ def analyse(recording, ear_distance, search_start_sample=None, search_end_sample
     right_ild = bandpass(x[window_start:window_end, 1], ILD_LOW_HZ, ILD_HIGH_HZ)
     ild = 20.0 * np.log10((rms(left_ild)+1e-12)/(rms(right_ild)+1e-12))
 
-    # A compact lag curve for the existing diagnostic plot.
-    representative = int(np.argmax(corrs))
-    start = chirp_starts[representative]
-    a = max(0, start - int(round(ITD_WINDOW_BEFORE_S*SAMPLE_RATE)))
-    b = min(len(x), a + int(round(ITD_WINDOW_DURATION_S*SAMPLE_RATE)))
-    z = bandpass(x[a:b, :2])
-    l = z[:,0]-z[:,0].mean(); r = z[:,1]-z[:,1].mean()
-    max_lag = int(np.ceil(ear_distance/SPEED_OF_SOUND*ITD_LIMIT_MARGIN*SAMPLE_RATE))
-    lags = np.arange(-max_lag, max_lag+1)
-    corr_curve = []
-    for lag in lags:
-        if lag > 0: aa, bb = l[:-lag], r[lag:]
-        elif lag < 0: aa, bb = l[-lag:], r[:lag]
-        else: aa, bb = l, r
-        corr_curve.append(np.dot(aa,bb)/(np.linalg.norm(aa)*np.linalg.norm(bb)+1e-15))
+    # Plot the same joint GCC-PHAT curve that actually determines the ITD.
+    lags = consensus_lags_s * SAMPLE_RATE
+    corr_curve = consensus_curve
 
     detection_curve = np.full(len(score), np.nan)
     detection_curve[max(0,search_start_sample):min(len(score),search_end_sample)] = \
@@ -347,9 +382,9 @@ def save_plot(result, path):
         label=f"ITD = {result['itd']*1e6:+.1f} us",
     )
     ax[2].set(
-        title=f"Windowed ITD correlation ({ITD_LOW_HZ:.0f}-{ITD_HIGH_HZ:.0f} Hz)",
+        title="Three-chirp consensus GCC-PHAT (350-9000 Hz)",
         xlabel="Right-ear delay relative to left (us)",
-        ylabel="Correlation",
+        ylabel="Normalized consensus strength",
     )
     ax[2].legend()
     ax[2].grid(True, alpha=0.3)
