@@ -11,7 +11,6 @@ import urllib.request
 import soundfile
 from scipy.signal import butter, sosfiltfilt, fftconvolve, find_peaks
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 import LBB.config as Config
@@ -308,91 +307,20 @@ def analyse(recording, ear_distance, search_start_sample=None, search_end_sample
     right_ild = bandpass(x[window_start:window_end, 1], ILD_LOW_HZ, ILD_HIGH_HZ)
     ild = 20.0 * np.log10((rms(left_ild)+1e-12)/(rms(right_ild)+1e-12))
 
-    # Plot the same joint GCC-PHAT curve that actually determines the ITD.
-    lags = consensus_lags_s * SAMPLE_RATE
-    corr_curve = consensus_curve
-
-    detection_curve = np.full(len(score), np.nan)
-    detection_curve[max(0,search_start_sample):min(len(score),search_end_sample)] = \
-        np.abs(score[max(0,search_start_sample):min(len(score),search_end_sample)])
-
     return {
-        "left_full": x[:,0], "right_full": x[:,1],
-        "left": x[window_start:window_end,0], "right": x[window_start:window_end,1],
-        "detection_curve": detection_curve, "chirp_start": chirp_starts[0],
+        "chirp_start": chirp_starts[0],
         "chirp_starts": chirp_starts, "chirp_scores": chirp_scores,
         "reference_start_s": reference_start_s,
         "window_start": window_start, "window_end": window_end,
         "detection_score": detection_score, "second_detection_score": second_score,
         "detection_prominence": detection_prominence,
         "search_start_sample": search_start_sample, "search_end_sample": search_end_sample,
-        "lags": lags, "corr": np.asarray(corr_curve),
         "lag_samples": lag_samples, "itd": itd, "bearing": bearing,
         "ild": float(ild), "itd_correlation": float(np.median(corrs)),
         "individual_itd_us": [v*1e6 for v in itds], "individual_correlations": corrs,
         "individual_lag_samples": [v*SAMPLE_RATE for v in itds],
         "itd_spread_us": itd_spread_us,
     }
-
-def save_plot(result, path):
-    left_full = result["left_full"]
-    right_full = result["right_full"]
-
-    t = np.arange(len(left_full)) / SAMPLE_RATE
-    scale = max(np.max(np.abs(left_full)), np.max(np.abs(right_full)), 1.0)
-
-    fig, ax = plt.subplots(3, 1, figsize=(10, 9))
-
-    ax[0].plot(t, left_full / scale, label="Left ear", alpha=0.75)
-    ax[0].plot(t, right_full / scale, label="Right ear", alpha=0.75)
-    ax[0].axvspan(
-        result["window_start"] / SAMPLE_RATE,
-        result["window_end"] / SAMPLE_RATE,
-        alpha=0.2,
-        label="Analysis window",
-    )
-    ax[0].set(
-        title="Full stereo recording and detected chirp window",
-        xlabel="Time (s)",
-        ylabel="Normalized amplitude",
-    )
-    ax[0].legend()
-    ax[0].grid(True, alpha=0.3)
-
-    detection_t = np.arange(len(result["detection_curve"])) / SAMPLE_RATE
-    ax[1].plot(detection_t, np.abs(result["detection_curve"]))
-    ax[1].axvline(
-        result["chirp_start"] / SAMPLE_RATE,
-        linestyle="--",
-        label=f"Detected start = {result['chirp_start']/SAMPLE_RATE:.3f} s",
-    )
-    ax[1].set(
-        title="Three-chirp packet detection",
-        xlabel="Candidate chirp start time (s)",
-        ylabel="Normalized match",
-    )
-    ax[1].legend()
-    ax[1].grid(True, alpha=0.3)
-
-    lag_us = result["lags"] / SAMPLE_RATE * 1e6
-    ax[2].plot(lag_us, result["corr"])
-    ax[2].axvline(
-        result["itd"] * 1e6,
-        linestyle="--",
-        label=f"ITD = {result['itd']*1e6:+.1f} us",
-    )
-    ax[2].set(
-        title="Three-chirp consensus GCC-PHAT (350-9000 Hz)",
-        xlabel="Right-ear delay relative to left (us)",
-        ylabel="Normalized consensus strength",
-    )
-    ax[2].legend()
-    ax[2].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-
 
 def post_binaural_result(server, port, fields, endpoint="/binaural_result"):
     body = urllib.parse.urlencode(fields).encode()
@@ -420,11 +348,6 @@ def main():
         raise SystemExit(
             "Launch this test through the synchronized server/client binaural path."
         )
-
-    save_path = os.path.join(
-        f"{Config.repo_path}/boxes/audio/signal-processing/python/measurement",
-        "binaural_chirp_test.png",
-    )
 
     with suppress_native_stderr():
         input_device = Utilities.get_input_device_by_name("MAX")
@@ -486,8 +409,7 @@ def main():
             time.sleep(0.005)
 
         # mic.sound is preallocated to max_samples. Only [:valid_samples] contains
-        # captured audio until that buffer fills. Take one locked snapshot and use
-        # this exact array for both analysis and WAV export.
+        # captured audio until that buffer fills. Take one locked snapshot for analysis.
         with mic.mutex:
             valid_samples = int(mic.valid_samples)
             recording = np.copy(mic.sound[:valid_samples, :])
@@ -528,18 +450,6 @@ def main():
             f"  {name}: min={np.min(x):+.8f}, max={np.max(x):+.8f}, "
             f"rms={rms:.8f}, nonzero={np.count_nonzero(x)}/{x.size}"
         )
-
-    # Save the same normalized float32 samples used by analyse(). soundfile
-    # performs the float [-1, 1] -> signed PCM_32 conversion correctly.
-    safe_run_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in run_id)
-    safe_pi_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in pi_name)
-    raw_wav_path = os.path.expanduser(
-        f"~/binaural_raw_{safe_run_id}_{safe_pi_name}.wav"
-    )
-    soundfile.write(
-        raw_wav_path, recording[:, :2], SAMPLE_RATE, subtype="PCM_32"
-    )
-    print(f"Raw stereo WAV saved:  {raw_wav_path}")
 
     # Convert the matched-filter sample offset in the captured snapshot into the
     # same Chrony-disciplined epoch used by the server.
@@ -606,8 +516,6 @@ def main():
     else:
         print("\nMeasurement confidence: OK")
 
-    save_plot(result, save_path)
-
     fields = {
         "id": pi_name,
         "run": run_id,
@@ -630,7 +538,6 @@ def main():
     }
     reply = post_binaural_result(server, port, fields)
     print(f"Result sent to server: {bool(reply.get('ok'))}")
-    print(f"Diagnostic plot saved to:\n  {save_path}")
 
 
 if __name__ == "__main__":
