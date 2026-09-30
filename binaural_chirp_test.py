@@ -335,8 +335,8 @@ def main():
     p = argparse.ArgumentParser(
         description="Record a server-scheduled localisation chirp and estimate ToA/ITD/ILD."
     )
-    p.add_argument("--post-roll", type=float, default=1.5,
-                   help="Seconds to continue recording after scheduled emission (minimum 1.5 s).")
+    p.add_argument("--post-roll", type=float, default=3.0,
+                   help="Seconds to continue recording after scheduled emission (minimum 3.0 s).")
     p.add_argument("--ear-distance", type=float, default=EAR_DISTANCE_M)
     args = p.parse_args()
 
@@ -399,10 +399,10 @@ def main():
     print(f"Pre-roll:              {(emit_at-record_start_epoch)*1000:.1f} ms")
     print(f"Detection search:      T+{DETECTION_SEARCH_START_S*1000:.0f} to T+{DETECTION_SEARCH_END_S*1000:.0f} ms")
 
-    # Keep the microphone running beyond the complete localisation packet.
-    # A minimum of 1.5 s after T leaves substantial margin for audio-backend
-    # latency, acoustic propagation and scheduling jitter while shortening each run.
-    post_roll_s = max(1.5, float(args.post_roll))
+    # Keep the microphone running well beyond the complete 0.880 s localisation
+    # packet.  A minimum of 3 s after T deliberately gives the audio backend,
+    # acoustic propagation and any scheduling jitter ample margin.
+    post_roll_s = max(3.0, float(args.post_roll))
     stop_at = emit_at + post_roll_s
     try:
         while time.time() < stop_at:
